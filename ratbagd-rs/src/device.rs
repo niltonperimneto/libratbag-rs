@@ -10,12 +10,69 @@ pub enum ActionType {
     Unknown = 1000,
 }
 
-/* Color as an RGB triplet. */
+/* Compact RGB color used for LED effect payloads. */
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RgbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/* Color as an RGB triplet exposed over DBus (u32 fields for compatibility). */
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Color {
     pub red: u32,
     pub green: u32,
     pub blue: u32,
+}
+
+impl Color {
+    /* Convert a DBus Color into a compact RgbColor, clamping to u8 range. */
+    pub fn to_rgb(self) -> RgbColor {
+        RgbColor {
+            r: self.red.min(255) as u8,
+            g: self.green.min(255) as u8,
+            b: self.blue.min(255) as u8,
+        }
+    }
+
+    /* Build a DBus Color from a compact RgbColor. */
+    pub fn from_rgb(rgb: RgbColor) -> Self {
+        Self {
+            red: u32::from(rgb.r),
+            green: u32::from(rgb.g),
+            blue: u32::from(rgb.b),
+        }
+    }
+}
+
+/* LED effect modes matching the HID++ 2.0 protocol values. */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LedMode {
+    Off = 0,
+    Solid = 1,
+    Cycle = 3,
+    ColorWave = 4,
+    Starlight = 5,
+    Breathing = 10,
+    TriColor = 32,
+}
+
+impl LedMode {
+    /* Convert a raw DBus u32 value into a LedMode. */
+    pub fn from_u32(val: u32) -> Option<LedMode> {
+        match val {
+            0 => Some(LedMode::Off),
+            1 => Some(LedMode::Solid),
+            3 => Some(LedMode::Cycle),
+            4 => Some(LedMode::ColorWave),
+            5 => Some(LedMode::Starlight),
+            10 => Some(LedMode::Breathing),
+            32 => Some(LedMode::TriColor),
+            _ => None,
+        }
+    }
 }
 
 /* Resolution value, either unified or per-axis. */
@@ -122,9 +179,19 @@ impl DeviceInfo {
                 leds: (0..num_leds as u32)
                     .map(|li| LedInfo {
                         index: li,
-                        mode: 0,
-                        modes: vec![0, 1, 2, 3],
+                        mode: LedMode::Off,
+                        modes: vec![
+                            LedMode::Off,
+                            LedMode::Solid,
+                            LedMode::Cycle,
+                            LedMode::ColorWave,
+                            LedMode::Starlight,
+                            LedMode::Breathing,
+                            LedMode::TriColor,
+                        ],
                         color: Color::default(),
+                        secondary_color: Color::default(),
+                        tertiary_color: Color::default(),
                         color_depth: 1,
                         effect_duration: 0,
                         brightness: 255,
@@ -187,9 +254,11 @@ pub struct ButtonInfo {
 #[derive(Debug, Clone)]
 pub struct LedInfo {
     pub index: u32,
-    pub mode: u32,
-    pub modes: Vec<u32>,
+    pub mode: LedMode,
+    pub modes: Vec<LedMode>,
     pub color: Color,
+    pub secondary_color: Color,
+    pub tertiary_color: Color,
     pub color_depth: u32,
     pub effect_duration: u32,
     pub brightness: u32,

@@ -8,11 +8,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
-use crate::device::{DeviceInfo, Dpi, ProfileInfo};
+use crate::device::{Color, DeviceInfo, Dpi, LedMode, ProfileInfo, RgbColor};
 use crate::driver::DeviceIo;
 
 use super::hidpp::{
-    self, HidppReport, DEVICE_IDX_WIRED, PAGE_ADJUSTABLE_DPI, PAGE_ADJUSTABLE_REPORT_RATE,
+    self, HidppReport, DEVICE_IDX_WIRED, LED_HW_MODE_BREATHING, LED_HW_MODE_COLOR_WAVE,
+    LED_HW_MODE_CYCLE, LED_HW_MODE_FIXED, LED_HW_MODE_OFF, LED_HW_MODE_STARLIGHT,
+    LED_PAYLOAD_SIZE, PAGE_ADJUSTABLE_DPI, PAGE_ADJUSTABLE_REPORT_RATE,
     PAGE_COLOR_LED_EFFECTS, PAGE_DEVICE_NAME, PAGE_ONBOARD_PROFILES, PAGE_RGB_EFFECTS,
     PAGE_SPECIAL_KEYS_BUTTONS, ROOT_FEATURE_INDEX, ROOT_FN_GET_FEATURE,
     ROOT_FN_GET_PROTOCOL_VERSION,
@@ -28,6 +30,10 @@ const DPI_FN_GET_SENSOR_DPI: u8 = 0x01;
 /* Adjustable Report Rate (0x8060) function IDs */
 const RATE_FN_GET_REPORT_RATE_LIST: u8 = 0x00;
 const RATE_FN_GET_REPORT_RATE: u8 = 0x01;
+
+/* Color LED Effects (0x8070) function IDs */
+const LED_FN_GET_ZONE_EFFECT: u8 = 0x01;
+const LED_FN_SET_ZONE_EFFECT: u8 = 0x02;
 
 /* A feature page → runtime index mapping for a known set of capabilities. */
 #[derive(Debug, Default)]
@@ -241,6 +247,143 @@ impl Hidpp20Driver {
         Ok(())
     }
 
+    /* Read LED zone effect from the device using feature 0x8070. */
+    async fn read_led_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &mut ProfileInfo,
+    ) -> Result<()> {
+        let Some(idx) = self.features.color_led_effects else {
+            return Ok(());
+        };
+
+        for led in &mut profile.leds {
+            let zone_index = led.index as u8;
+            let response = self
+                .feature_request(io, idx, LED_FN_GET_ZONE_EFFECT, &[zone_index])
+                .await?;
+
+            /* response[0] = zone_index echo */
+            /* response[1..12] = hidpp20_internal_led (11 bytes) */
+            if response[0] != zone_index {
+                warn!("LED read: zone mismatch (expected {zone_index}, got {})", response[0]);
+                continue;
+            }
+
+            let payload = &response[1..1 + LED_PAYLOAD_SIZE];
+            let mode_byte = payload[0];
+
+            match mode_byte {
+                LED_HW_MODE_OFF => {
+                    led.mode = LedMode::Off;
+                }
+                LED_HW_MODE_FIXED => {
+                    led.mode = LedMode::Solid;
+                    led.color = Color::from_rgb(RgbColor {
+                        r: payload[1],
+                        g: payload[2],
+                        b: payload[3],
+                    });
+                }
+                LED_HW_MODE_CYCLE => {
+                    led.mode = LedMode::Cycle;
+                    led.effect_duration =
+                        u32::from(u16::from_be_bytes([payload[6], payload[7]]));
+                    led.brightness = u32::from(payload[8]) * 255 / 100;
+                }
+                LED_HW_MODE_COLOR_WAVE => {
+                    led.mode = LedMode::ColorWave;
+                    led.effect_duration =
+                        u32::from(u16::from_be_bytes([payload[6], payload[7]]));
+                    led.brightness = u32::from(payload[8]) * 255 / 100;
+                }
+                LED_HW_MODE_STARLIGHT => {
+                    led.mode = LedMode::Starlight;
+                    led.color = Color::from_rgb(RgbColor {
+                        r: payload[1],
+                        g: payload[2],
+                        b: payload[3],
+                    });
+                    led.secondary_color = Color::from_rgb(RgbColor {
+                        r: payload[4],
+                        g: payload[5],
+                        b: payload[6],
+                    });
+                }
+                LED_HW_MODE_BREATHING => {
+                    led.mode = LedMode::Breathing;
+                    led.color = Color::from_rgb(RgbColor {
+                        r: payload[1],
+                        g: payload[2],
+                        b: payload[3],
+                    });
+                    led.effect_duration =
+                        u32::from(u16::from_be_bytes([payload[4], payload[5]]));
+                    led.brightness = u32::from(payload[7]) * 255 / 100;
+                }
+                _ => {
+                    debug!("LED zone {zone_index}: unknown mode 0x{mode_byte:02X}");
+                }
+            }
+
+            debug!("LED zone {zone_index}: mode={:?}", led.mode);
+        }
+
+        Ok(())
+    }
+
+    /* Write LED zone effect to the device using feature 0x8070. */
+    /* TriColor mode is routed through feature 0x8071 (RGB Effects) instead. */
+    async fn write_led_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &ProfileInfo,
+    ) -> Result<()> {
+        for led in &profile.leds {
+            let zone_index = led.index as u8;
+
+            if led.mode == LedMode::TriColor {
+                /* TriColor uses 0x8071 RGB Effects with the multi-LED cluster pattern command. */
+                let Some(idx) = self.features.rgb_effects else {
+                    warn!("TriColor requested but device lacks RGB Effects (0x8071)");
+                    continue;
+                };
+                let led_payload = hidpp::build_led_payload(led);
+
+                /* Multi-LED pattern: [zone_index, ...payload..., 0x01 (persist)] */
+                let mut params = [0u8; 13];
+                params[0] = zone_index;
+                params[1..12].copy_from_slice(&led_payload);
+                params[12] = 0x01;
+
+                /* Function 0x02 = setMultiLEDRGBClusterPattern on 0x8071 */
+                self.feature_request(io, idx, 0x02, &params)
+                    .await
+                    .context("Failed to write TriColor multi-LED cluster pattern")?;
+            } else {
+                let Some(idx) = self.features.color_led_effects else {
+                    warn!("Device lacks Color LED Effects (0x8070)");
+                    continue;
+                };
+                let led_payload = hidpp::build_led_payload(led);
+
+                /* Param layout: [zone_index, ...11-byte payload..., 0x01 (persist to flash)] */
+                let mut params = [0u8; 13];
+                params[0] = zone_index;
+                params[1..12].copy_from_slice(&led_payload);
+                params[12] = 0x01;
+
+                self.feature_request(io, idx, LED_FN_SET_ZONE_EFFECT, &params)
+                    .await
+                    .context("Failed to write LED zone effect")?;
+            }
+
+            debug!("HID++ 2.0: committed LED zone {zone_index} mode={:?}", led.mode);
+        }
+
+        Ok(())
+    }
+
     /* Write DPI sensor information using feature 0x2201. */
     async fn write_dpi_info(
         &self,
@@ -342,6 +485,9 @@ impl super::DeviceDriver for Hidpp20Driver {
             if let Err(e) = self.read_report_rate(io, profile).await {
                 warn!("Failed to read report rate for profile {}: {e}", profile.index);
             }
+            if let Err(e) = self.read_led_info(io, profile).await {
+                warn!("Failed to read LEDs for profile {}: {e}", profile.index);
+            }
         }
 
         debug!("HID++ 2.0: loaded {} profiles", info.profiles.len());
@@ -355,6 +501,9 @@ impl super::DeviceDriver for Hidpp20Driver {
             }
             if let Err(e) = self.write_report_rate(io, profile).await {
                 warn!("Failed to commit report rate for profile {}: {e:#}", profile.index);
+            }
+            if let Err(e) = self.write_led_info(io, profile).await {
+                warn!("Failed to commit LEDs for profile {}: {e:#}", profile.index);
             }
         }
         Ok(())
