@@ -1,3 +1,5 @@
+/* Shared ratbagd error definitions: RatbagError aggregates device/capability/value/system/DBus
+ * failures for callers that need a single error type. */
 use thiserror::Error;
 
 /* Errors that may occur in ratbagd-rs. */

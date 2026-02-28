@@ -71,7 +71,6 @@ impl FeatureMap {
 }
 
 /* Feature 0x2201 (Adjustable DPI): Payload for Get/Set Sensor DPI */
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct Hidpp20DpiPayload {
     pub sensor_index: u8,
@@ -111,7 +110,6 @@ impl Hidpp20DpiPayload {
 }
 
 /* Feature 0x8060 (Adjustable Report Rate) */
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20ReportRatePayload {
     pub data: u8, // Used for rate_bitmap or rate_ms
@@ -128,7 +126,6 @@ impl Hidpp20ReportRatePayload {
 }
 
 /* Feature 0x8070 & 0x8071 (Color LED / RGB) */
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20LedGetZonePayload {
     pub zone_index: u8,
@@ -147,7 +144,6 @@ impl Hidpp20LedGetZonePayload {
     }
 }
 
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20LedSetZonePayload {
     pub zone_index: u8,
@@ -169,7 +165,6 @@ impl Hidpp20LedSetZonePayload {
 }
 
 /* HID++ 2.0 Button Binding representation (4 bytes) */
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20ButtonBinding {
     pub button_type: u8,
@@ -256,7 +251,6 @@ impl Hidpp20ButtonBinding {
 }
 
 /* Feature 0x8100: Onboard Profiles */
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20OnboardProfilesInfo {
     pub memory_model: u8,
@@ -307,6 +301,7 @@ pub struct Hidpp20Driver {
     device_index: u8,
     version: ProtocolVersion,
     features: FeatureMap,
+    cached_onboard_info: Option<Hidpp20OnboardProfilesInfo>,
 }
 
 impl Hidpp20Driver {
@@ -315,6 +310,7 @@ impl Hidpp20Driver {
             device_index: DEVICE_IDX_WIRED,
             version: ProtocolVersion::default(),
             features: FeatureMap::default(),
+            cached_onboard_info: None,
         }
     }
 
@@ -819,6 +815,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                 .context("Failed to get Onboard Profiles Description")?;
 
             let desc = Hidpp20OnboardProfilesInfo::from_bytes(&desc_data);
+            self.cached_onboard_info = Some(desc);
             let profile_count = desc.profile_count as usize;
             let button_count = desc.button_count as usize;
             
@@ -872,7 +869,11 @@ impl super::DeviceDriver for Hidpp20Driver {
             }
         }
 
-        info.profiles[0].is_active = true;
+        if let Some(first) = info.profiles.first_mut() {
+            first.is_active = true;
+        } else {
+            warn!("HID++ 2.0: no profiles available after load");
+        }
 
         for profile in &mut info.profiles {
             if let Err(e) = self.read_dpi_info(io, profile).await {
@@ -905,8 +906,7 @@ impl super::DeviceDriver for Hidpp20Driver {
 
         // Onboard Profiles (0x8100) EEPROM commit logic
         if let Some(idx) = self.features.onboard_profiles {
-            if let Ok(desc_data) = self.feature_request(io, idx, PROFILES_FN_GET_PROFILES_DESCR, &[]).await {
-                let desc = Hidpp20OnboardProfilesInfo::from_bytes(&desc_data);
+            if let Some(desc) = self.cached_onboard_info {
                 let sector_size = desc.sector_size();
                 
                 if let Ok(root_sector_data) = self.read_sector(io, idx, 0x0000, 0, sector_size).await {

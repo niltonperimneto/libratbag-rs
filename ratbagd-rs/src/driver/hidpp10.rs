@@ -24,7 +24,6 @@ const SUB_ID_SET_LONG_REGISTER: u8 = 0x82;
 
 /* Feature Payloads */
 
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp10RefreshRatePayload {
     pub rate: u8,
@@ -42,7 +41,6 @@ impl Hidpp10RefreshRatePayload {
     }
 }
 
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp10LedColorPayload {
     pub r: u8,
@@ -60,7 +58,6 @@ impl Hidpp10LedColorPayload {
     }
 }
 
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp10ResolutionLongPayload {
     pub xres: [u8; 2], // Little Endian

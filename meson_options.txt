@@ -1,13 +1,3 @@
-option('udev-dir',
-	type: 'string',
-	value: '',
-	description: 'udev base directory [default=$prefix/lib/udev]')
-
-option('tests',
-	type: 'boolean',
-	value: true,
-	description: 'Build the tests (default=yes)')
-
 option('systemd-unit-dir',
 	type : 'string',
 	value : '',
@@ -18,11 +8,6 @@ option('dbus-root-dir',
 	value : '',
 	description : 'dbus service directory [default=$datadir/dbus-1]')
 
-option('documentation',
-	type: 'boolean',
-	value: false,
-	description: 'Enable documentation build (default=no)')
-
 option('dbus-group',
 	type: 'string',
 	value : '',
@@ -32,9 +17,3 @@ option('systemd',
 	type : 'boolean',
 	value : true,
 	description : 'Build systemd unit files')
-
-option('logind-provider',
-  type : 'combo',
-  choices: [ 'elogind', 'systemd'],
-  value : 'systemd',
-  description : 'Which logind provider to use')

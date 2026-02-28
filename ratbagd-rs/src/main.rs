@@ -1,9 +1,13 @@
+/* ratbagd-rs entrypoint: sets up tracing, loads the device database, spawns the udev monitor,
+ * and starts the DBus server. */
 mod actor;
 mod dbus;
 mod device;
 mod device_database;
 mod driver;
 mod error;
+#[cfg(feature = "dev-hooks")]
+mod test_device;
 mod udev_monitor;
 
 use std::path::PathBuf;

@@ -1,3 +1,5 @@
+/* Parser and lookup for .device files: loads INI entries into DeviceDb keyed by bus/vid/pid and
+ * exposes typed structs for matches and driver-specific config. */
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;

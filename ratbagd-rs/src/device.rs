@@ -1,4 +1,6 @@
-/* Button action types exposed over DBus. */
+/* Canonical device state shared across DBus objects and drivers: device/profile/resolution/button
+ * and LED structures plus enums for actions, DPI, and LED modes. */
+/// Button action types exposed over DBus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum ActionType {
@@ -9,6 +11,21 @@ pub enum ActionType {
     Key = 3,
     Macro = 4,
     Unknown = 1000,
+}
+
+impl ActionType {
+    /// Convert a raw DBus `u32` value into an `ActionType`.
+    /// Unknown discriminants map to [`ActionType::Unknown`].
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            0 => Self::None,
+            1 => Self::Button,
+            2 => Self::Special,
+            3 => Self::Key,
+            4 => Self::Macro,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /* Compact RGB color used for LED effect payloads. */
@@ -213,7 +230,19 @@ impl DeviceInfo {
     }
 }
 
-/* Profile state. */
+impl DeviceInfo {
+    /// Find a profile by its `index` field.
+    pub fn find_profile(&self, id: u32) -> Option<&ProfileInfo> {
+        self.profiles.iter().find(|p| p.index == id)
+    }
+
+    /// Find a mutable profile by its `index` field.
+    pub fn find_profile_mut(&mut self, id: u32) -> Option<&mut ProfileInfo> {
+        self.profiles.iter_mut().find(|p| p.index == id)
+    }
+}
+
+/// Profile state.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileInfo {
     pub index: u32,
@@ -231,7 +260,39 @@ pub struct ProfileInfo {
     pub leds: Vec<LedInfo>,
 }
 
-/* Resolution state. */
+impl ProfileInfo {
+    /// Find a resolution by its `index` field.
+    pub fn find_resolution(&self, id: u32) -> Option<&ResolutionInfo> {
+        self.resolutions.iter().find(|r| r.index == id)
+    }
+
+    /// Find a mutable resolution by its `index` field.
+    pub fn find_resolution_mut(&mut self, id: u32) -> Option<&mut ResolutionInfo> {
+        self.resolutions.iter_mut().find(|r| r.index == id)
+    }
+
+    /// Find a button by its `index` field.
+    pub fn find_button(&self, id: u32) -> Option<&ButtonInfo> {
+        self.buttons.iter().find(|b| b.index == id)
+    }
+
+    /// Find a mutable button by its `index` field.
+    pub fn find_button_mut(&mut self, id: u32) -> Option<&mut ButtonInfo> {
+        self.buttons.iter_mut().find(|b| b.index == id)
+    }
+
+    /// Find an LED by its `index` field.
+    pub fn find_led(&self, id: u32) -> Option<&LedInfo> {
+        self.leds.iter().find(|l| l.index == id)
+    }
+
+    /// Find a mutable LED by its `index` field.
+    pub fn find_led_mut(&mut self, id: u32) -> Option<&mut LedInfo> {
+        self.leds.iter_mut().find(|l| l.index == id)
+    }
+}
+
+/// Resolution state.
 #[derive(Debug, Clone, Default)]
 pub struct ResolutionInfo {
     pub index: u32,
@@ -243,7 +304,7 @@ pub struct ResolutionInfo {
     pub is_disabled: bool,
 }
 
-/* Button mapping state. */
+/// Button mapping state.
 #[derive(Debug, Clone, Default)]
 pub struct ButtonInfo {
     pub index: u32,
@@ -253,7 +314,7 @@ pub struct ButtonInfo {
     pub macro_entries: Vec<(u32, u32)>,
 }
 
-/* LED state. */
+/// LED state.
 #[derive(Debug, Clone)]
 pub struct LedInfo {
     pub index: u32,

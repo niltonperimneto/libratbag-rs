@@ -1,3 +1,5 @@
+/* DBus surface: zbus interface implementations for Manager/Device/Profile/Resolution/Button/LED,
+ * plus helpers to register devices and translate device actions from udev. */
 pub mod button;
 pub mod device;
 pub mod led;
@@ -11,6 +13,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
+use zbus::connection::Builder;
+use zbus::zvariant::OwnedValue;
 
 use crate::actor::{self, ActorHandle};
 use crate::device::DeviceInfo;
@@ -18,66 +22,90 @@ use crate::device_database::{BusType, DeviceDb};
 use crate::driver;
 use crate::udev_monitor::DeviceAction;
 
-/* Register a new device and its children (profiles, buttons, etc) onto the DBus bus. */
-/* Returns a list of all object paths that were registered. */
+/// Fallback [`OwnedValue`] (`u32` zero) used when zvariant serialization fails.
+#[inline]
+pub(crate) fn fallback_owned_value() -> OwnedValue {
+    OwnedValue::from(0u32)
+}
+
+/// Register a new device and its children (profiles, buttons, etc) onto the DBus bus.
+///
+/// Returns a list of all object paths that were registered.
+/// Child objects share the same `Arc<RwLock<DeviceInfo>>` so property
+/// mutations propagate to the device-level `commit()` path.
 async fn register_device_on_dbus(
     conn: &zbus::Connection,
-    sysname: &str,
+    device_path: &str,
     shared_info: Arc<RwLock<DeviceInfo>>,
     actor_handle: Option<ActorHandle>,
 ) -> Vec<String> {
-    let device_path = format!(
-        "/org/freedesktop/ratbag1/device/{}",
-        sysname.replace('-', "_")
-    );
-    let mut object_paths = vec![device_path.clone()];
+    let mut object_paths = Vec::with_capacity(64);
+    object_paths.push(device_path.to_owned());
     let object_server = conn.object_server();
 
-    /* Register the Device object */
+    // Register the Device object.
     let device_obj = device::RatbagDevice::new(
         Arc::clone(&shared_info),
-        device_path.clone(),
+        device_path.to_owned(),
         actor_handle,
     );
 
-    if let Err(e) = object_server.at(device_path.as_str(), device_obj).await {
-        warn!("Failed to register device {}: {}", sysname, e);
+    if let Err(e) = object_server.at(device_path, device_obj).await {
+        warn!("Failed to register device at {device_path}: {e}");
         return object_paths;
     }
 
-    /* Register Profile, Resolution, Button, LED child objects */
+    // Register Profile, Resolution, Button, LED child objects.
+    // We snapshot the structure for iteration but children hold the shared
+    // Arc so mutations propagate correctly to the commit path.
     let info_snapshot = shared_info.read().await;
     for prof in &info_snapshot.profiles {
-        let profile_path = format!("{}/p{}", device_path, prof.index);
-        let profile_obj = profile::RatbagProfile::new(prof.clone(), device_path.clone());
+        let profile_path = format!("{device_path}/p{}", prof.index);
+        let profile_obj = profile::RatbagProfile::new(
+            Arc::clone(&shared_info),
+            device_path.to_owned(),
+            prof.index,
+        );
         if let Err(e) = object_server.at(profile_path.as_str(), profile_obj).await {
-            warn!("Failed to register profile {}: {}", profile_path, e);
+            warn!("Failed to register profile {profile_path}: {e}");
         }
         object_paths.push(profile_path.clone());
 
         for res in &prof.resolutions {
-            let res_path = format!("{}/p{}/r{}", device_path, prof.index, res.index);
-            let res_obj = resolution::RatbagResolution::new(res.clone());
+            let res_path = format!("{device_path}/p{}/r{}", prof.index, res.index);
+            let res_obj = resolution::RatbagResolution::new(
+                Arc::clone(&shared_info),
+                prof.index,
+                res.index,
+            );
             if let Err(e) = object_server.at(res_path.as_str(), res_obj).await {
-                warn!("Failed to register resolution {}: {}", res_path, e);
+                warn!("Failed to register resolution {res_path}: {e}");
             }
             object_paths.push(res_path);
         }
 
         for btn in &prof.buttons {
-            let btn_path = format!("{}/p{}/b{}", device_path, prof.index, btn.index);
-            let btn_obj = button::RatbagButton::new(btn.clone());
+            let btn_path = format!("{device_path}/p{}/b{}", prof.index, btn.index);
+            let btn_obj = button::RatbagButton::new(
+                Arc::clone(&shared_info),
+                prof.index,
+                btn.index,
+            );
             if let Err(e) = object_server.at(btn_path.as_str(), btn_obj).await {
-                warn!("Failed to register button {}: {}", btn_path, e);
+                warn!("Failed to register button {btn_path}: {e}");
             }
             object_paths.push(btn_path);
         }
 
         for led_info in &prof.leds {
-            let led_path = format!("{}/p{}/l{}", device_path, prof.index, led_info.index);
-            let led_obj = led::RatbagLed::new(led_info.clone());
+            let led_path = format!("{device_path}/p{}/l{}", prof.index, led_info.index);
+            let led_obj = led::RatbagLed::new(
+                Arc::clone(&shared_info),
+                prof.index,
+                led_info.index,
+            );
             if let Err(e) = object_server.at(led_path.as_str(), led_obj).await {
-                warn!("Failed to register led {}: {}", led_path, e);
+                warn!("Failed to register LED {led_path}: {e}");
             }
             object_paths.push(led_path);
         }
@@ -86,10 +114,68 @@ async fn register_device_on_dbus(
     object_paths
 }
 
-/* Starts the DBus server and registers all interfaces. */
-/*  */
-/* This function blocks until the daemon is shut down. It receives device */
-/* hotplug events from the udev monitor through the `device_rx` channel. */
+/// Unregister a device and all its children from the DBus object server,
+/// then remove it from the manager's device list.
+///
+/// Shared between the `Remove` (udev) and `RemoveTest` (dev-hooks) paths.
+async fn remove_device(
+    conn: &zbus::Connection,
+    sysname: &str,
+    registered_devices: &mut HashMap<String, Vec<String>>,
+    actor_handles: &mut HashMap<String, ActorHandle>,
+) -> Result<()> {
+    // Shut down the hardware actor if one is running.
+    if let Some(handle) = actor_handles.remove(sysname) {
+        handle.shutdown().await;
+    }
+
+    if let Some(paths) = registered_devices.remove(sysname) {
+        let object_server = conn.object_server();
+
+        // Remove child objects first (reverse order), then the device itself.
+        // We attempt all interface types per path; only the matching one succeeds.
+        for path in paths.iter().rev() {
+            let _ = object_server
+                .remove::<device::RatbagDevice, _>(path.as_str())
+                .await;
+            let _ = object_server
+                .remove::<profile::RatbagProfile, _>(path.as_str())
+                .await;
+            let _ = object_server
+                .remove::<resolution::RatbagResolution, _>(path.as_str())
+                .await;
+            let _ = object_server
+                .remove::<button::RatbagButton, _>(path.as_str())
+                .await;
+            let _ = object_server
+                .remove::<led::RatbagLed, _>(path.as_str())
+                .await;
+        }
+
+        // The device root path is always paths[0]; update the manager list.
+        let device_path = &paths[0];
+        let iface_ref = object_server
+            .interface::<_, manager::RatbagManager>("/org/freedesktop/ratbag1")
+            .await?;
+        iface_ref.get_mut().await.remove_device(device_path);
+        iface_ref
+            .get()
+            .await
+            .devices_changed(iface_ref.signal_emitter())
+            .await?;
+
+        info!("Device {} removed ({} objects)", sysname, paths.len());
+    } else {
+        info!("Device removed: {} (was not registered)", sysname);
+    }
+
+    Ok(())
+}
+
+/// Start the DBus server and register all interfaces.
+///
+/// This function blocks until the daemon is shut down. It receives device
+/// hotplug events from the udev monitor through the `device_rx` channel.
 pub async fn run_server(
     mut device_rx: mpsc::Receiver<DeviceAction>,
     device_db: DeviceDb,
@@ -104,14 +190,42 @@ pub async fn run_server(
 
     info!("DBus server ready on org.freedesktop.ratbag1");
 
-    /* Track registered device paths so we can clean up on removal */
+    // Under dev-hooks, wire a secondary channel to the manager so that
+    // LoadTestDevice / ResetTestDevice can inject synthetic DeviceActions
+    // into this same event loop.
+    #[cfg(feature = "dev-hooks")]
+    let mut test_rx = {
+        let (test_tx, test_rx) =
+            tokio::sync::mpsc::channel::<DeviceAction>(16);
+        let object_server = conn.object_server();
+        let iface_ref = object_server
+            .interface::<_, manager::RatbagManager>("/org/freedesktop/ratbag1")
+            .await?;
+        iface_ref.get_mut().await.set_test_device_tx(test_tx);
+        test_rx
+    };
+
+    // Track registered device paths so we can clean up on removal.
     let mut registered_devices: HashMap<String, Vec<String>> = HashMap::new();
 
-    /* Track actor handles so we can shut them down on removal */
+    // Track actor handles so we can shut them down on removal.
     let mut actor_handles: HashMap<String, ActorHandle> = HashMap::new();
 
-    /* Main event loop: process udev device events */
-    while let Some(action) = device_rx.recv().await {
+    // Main event loop: process udev device events (and, when dev-hooks is
+    // enabled, synthetic test device actions from the DBus manager).
+    loop {
+        // Multiplex the udev channel with the optional test channel.
+        #[cfg(feature = "dev-hooks")]
+        let action = tokio::select! {
+            a = device_rx.recv() => match a { Some(a) => a, None => break },
+            a = test_rx.recv()   => match a { Some(a) => a, None => break },
+        };
+        #[cfg(not(feature = "dev-hooks"))]
+        let action = match device_rx.recv().await {
+            Some(a) => a,
+            None => break,
+        };
+
         match action {
             DeviceAction::Add {
                 sysname,
@@ -146,17 +260,24 @@ pub async fn run_server(
                     sysname.replace('-', "_")
                 );
 
-                /* Wrap DeviceInfo in Arc<RwLock> so actor and DBus share state */
+                // Wrap DeviceInfo in Arc<RwLock> so actor and DBus share state.
                 let shared_info = Arc::new(RwLock::new(device_info));
 
-                /* Try to create and spawn the hardware driver actor */
+                // Try to create and spawn the hardware driver actor.
                 let actor_handle = match driver::create_driver(&entry.driver) {
                     Some(drv) => {
-                        match actor::spawn_device_actor(&devnode, drv, Arc::clone(&shared_info))
-                            .await
+                        match actor::spawn_device_actor(
+                            &devnode,
+                            drv,
+                            Arc::clone(&shared_info),
+                        )
+                        .await
                         {
                             Ok(handle) => {
-                                info!("Driver {} active for {}", entry.driver, sysname);
+                                info!(
+                                    "Driver {} active for {}",
+                                    entry.driver, sysname
+                                );
                                 Some(handle)
                             }
                             Err(e) => {
@@ -173,18 +294,20 @@ pub async fn run_server(
 
                 let object_paths = register_device_on_dbus(
                     &conn,
-                    &sysname,
+                    &device_path,
                     Arc::clone(&shared_info),
                     actor_handle.clone(),
-                ).await;
+                )
+                .await;
 
-
-                /* Update the manager's device list */
+                // Update the manager's device list.
                 let object_server = conn.object_server();
                 let iface_ref = object_server
-                    .interface::<_, manager::RatbagManager>("/org/freedesktop/ratbag1")
+                    .interface::<_, manager::RatbagManager>(
+                        "/org/freedesktop/ratbag1",
+                    )
                     .await?;
-                iface_ref.get_mut().await.add_device(device_path.clone()).await;
+                iface_ref.get_mut().await.add_device(device_path.clone());
                 iface_ref
                     .get()
                     .await
@@ -203,57 +326,65 @@ pub async fn run_server(
                     registered_devices[&sysname].len() - 1
                 );
             }
+
             DeviceAction::Remove { sysname } => {
-                /* Shut down the actor if one is running */
-                if let Some(handle) = actor_handles.remove(&sysname) {
-                    handle.shutdown().await;
-                }
+                remove_device(
+                    &conn,
+                    &sysname,
+                    &mut registered_devices,
+                    &mut actor_handles,
+                )
+                .await?;
+            }
 
-                if let Some(paths) = registered_devices.remove(&sysname) {
-                    let object_server = conn.object_server();
+            // ----------------------------------------------------------------
+            // dev-hooks only: synthetic test device injection
+            // ----------------------------------------------------------------
+            #[cfg(feature = "dev-hooks")]
+            DeviceAction::InjectTest { sysname, device_info } => {
+                let device_path = format!(
+                    "/org/freedesktop/ratbag1/device/{}",
+                    sysname.replace('-', "_")
+                );
 
-                    /* Remove child objects first (reverse order), then the device */
-                    for path in paths.iter().rev() {
-                        /* Try removing each interface type — only one will succeed per path */
-                        let _ = object_server
-                            .remove::<device::RatbagDevice, _>(path.as_str())
-                            .await;
-                        let _ = object_server
-                            .remove::<profile::RatbagProfile, _>(path.as_str())
-                            .await;
-                        let _ = object_server
-                            .remove::<resolution::RatbagResolution, _>(path.as_str())
-                            .await;
-                        let _ = object_server
-                            .remove::<button::RatbagButton, _>(path.as_str())
-                            .await;
-                        let _ = object_server
-                            .remove::<led::RatbagLed, _>(path.as_str())
-                            .await;
-                    }
+                info!("InjectTest: registering '{}' at {}", sysname, device_path);
 
-                    /* Update manager device list */
-                    let device_path = &paths[0];
-                    let iface_ref = object_server
-                        .interface::<_, manager::RatbagManager>(
-                            "/org/freedesktop/ratbag1",
-                        )
-                        .await?;
-                    iface_ref
-                        .get_mut()
-                        .await
-                        .remove_device(device_path)
-                        .await;
-                    iface_ref
-                        .get()
-                        .await
-                        .devices_changed(iface_ref.signal_emitter())
-                        .await?;
+                let shared_info = Arc::new(RwLock::new(device_info));
 
-                    info!("Device {} removed ({} objects)", sysname, paths.len());
-                } else {
-                    info!("Device removed: {} (was not registered)", sysname);
-                }
+                // Test devices have no hardware actor.
+                let object_paths = register_device_on_dbus(
+                    &conn,
+                    &device_path,
+                    Arc::clone(&shared_info),
+                    None,
+                )
+                .await;
+
+                let object_server = conn.object_server();
+                let iface_ref = object_server
+                    .interface::<_, manager::RatbagManager>(
+                        "/org/freedesktop/ratbag1",
+                    )
+                    .await?;
+                iface_ref.get_mut().await.add_device(device_path.clone());
+                iface_ref
+                    .get()
+                    .await
+                    .devices_changed(iface_ref.signal_emitter())
+                    .await?;
+
+                registered_devices.insert(sysname, object_paths);
+            }
+
+            #[cfg(feature = "dev-hooks")]
+            DeviceAction::RemoveTest { sysname } => {
+                remove_device(
+                    &conn,
+                    &sysname,
+                    &mut registered_devices,
+                    &mut actor_handles,
+                )
+                .await?;
             }
         }
     }
@@ -261,5 +392,3 @@ pub async fn run_server(
     info!("udev monitor channel closed, shutting down");
     Ok(())
 }
-
-use zbus::connection::Builder;

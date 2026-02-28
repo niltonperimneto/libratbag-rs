@@ -1,9 +1,18 @@
+/* Driver framework: DeviceDriver trait, DeviceIo HID helpers, driver factory, and shared driver
+ * error types used by all protocol implementations. */
 pub mod asus;
+pub mod etekcity;
+pub mod gskill;
 pub mod hidpp;
 pub mod hidpp10;
 pub mod hidpp20;
 pub mod logitech_g300;
+pub mod logitech_g600;
+pub mod marsgaming;
+pub mod openinput;
 pub mod roccat;
+pub mod sinowealth;
+pub mod sinowealth_nubwo;
 pub mod steelseries;
 
 use nix::libc;
@@ -256,13 +265,20 @@ pub trait DeviceDriver: Send + Sync {
 pub fn create_driver(driver_name: &str) -> Option<Box<dyn DeviceDriver>> {
     match driver_name {
         "asus" => Some(Box::new(asus::AsusDriver::new())),
+        "etekcity" => Some(Box::new(etekcity::EtekcityDriver::new())),
+        "gskill" => Some(Box::new(gskill::GskillDriver::new())),
         "hidpp10" => Some(Box::new(hidpp10::Hidpp10Driver::new())),
         "hidpp20" => Some(Box::new(hidpp20::Hidpp20Driver::new())),
+        "logitech_g300" => Some(Box::new(logitech_g300::LogitechG300Driver::new())),
+        "logitech_g600" => Some(Box::new(logitech_g600::LG600Driver::new())),
+        "marsgaming" => Some(Box::new(marsgaming::MarsGamingDriver::new())),
+        "openinput" => Some(Box::new(openinput::OpenInputDriver::new())),
         "roccat" | "roccat-kone-pure" | "roccat-kone-emp" => {
             Some(Box::new(roccat::RoccatDriver::new(driver_name)))
         }
+        "sinowealth" => Some(Box::new(sinowealth::SinowealhDriver::new())),
+        "sinowealth-nubwo" => Some(Box::new(sinowealth_nubwo::SinowealhNubwoDriver::new())),
         "steelseries" => Some(Box::new(steelseries::SteelseriesDriver::new())),
-        "logitech_g300" => Some(Box::new(logitech_g300::LogitechG300Driver::new())),
         _ => {
             warn!("Unknown driver: {driver_name}");
             None

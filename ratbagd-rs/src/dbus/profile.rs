@@ -1,171 +1,245 @@
+/* DBus Profile interface: exposes per-profile properties (name, rate, angle snapping, debounce,
+ * resolutions/buttons/leds lists) backed by shared DeviceInfo and optional actor commit hook. */
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use zbus::interface;
 use zbus::zvariant::ObjectPath;
 
-use crate::device::ProfileInfo;
+use crate::device::DeviceInfo;
 
-/* The org.freedesktop.ratbag1.Profile interface. */
-/*  */
-/* Represents one of a device's configurable profiles, containing */
-/* resolutions, buttons, and LEDs. */
+/// The `org.freedesktop.ratbag1.Profile` interface.
+///
+/// Represents one of a device's configurable profiles, containing
+/// resolutions, buttons, and LEDs.
+///
+/// State is shared with the parent device through `Arc<RwLock<DeviceInfo>>`
+/// so that mutations here are visible to `commit()`.
+/// Items are looked up by their stored `.index` ID, not by vector position,
+/// guarding against non-contiguous or reordered indices.
 pub struct RatbagProfile {
-    info: Arc<RwLock<ProfileInfo>>,
+    device_info: Arc<RwLock<DeviceInfo>>,
     device_path: String,
+    profile_id: u32,
 }
 
 impl RatbagProfile {
-    pub fn new(info: ProfileInfo, device_path: String) -> Self {
+    pub fn new(
+        device_info: Arc<RwLock<DeviceInfo>>,
+        device_path: String,
+        profile_id: u32,
+    ) -> Self {
         Self {
-            info: Arc::new(RwLock::new(info)),
+            device_info,
             device_path,
+            profile_id,
         }
     }
 }
 
 #[interface(name = "org.freedesktop.ratbag1.Profile")]
 impl RatbagProfile {
-    /* Zero-based profile index (constant). */
+    /// Zero-based profile index (constant).
     #[zbus(property)]
-    async fn index(&self) -> u32 {
-        self.info.read().await.index
+    fn index(&self) -> u32 {
+        self.profile_id
     }
 
-    /* Profile name (read-write). Empty string means name cannot be changed. */
+    /// Profile name (read-write). Empty string means name cannot be changed.
     #[zbus(property)]
     async fn name(&self) -> String {
-        self.info.read().await.name.clone()
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
     }
 
     #[zbus(property)]
     async fn set_name(&self, name: String) {
-        let mut info = self.info.write().await;
-        info.name = name;
-        info.is_dirty = true;
+        let mut info = self.device_info.write().await;
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.name = name;
+            profile.is_dirty = true;
+        }
     }
 
-    /* True if this profile is disabled. */
+    /// True if this profile is disabled.
     #[zbus(property)]
     async fn disabled(&self) -> bool {
-        !self.info.read().await.is_enabled
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .is_some_and(|p| !p.is_enabled)
     }
 
     #[zbus(property)]
     async fn set_disabled(&self, disabled: bool) {
-        let mut info = self.info.write().await;
-        info.is_enabled = !disabled;
-        info.is_dirty = true;
+        let mut info = self.device_info.write().await;
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.is_enabled = !disabled;
+            profile.is_dirty = true;
+        }
     }
 
-    /* True if this is the active profile (read-only). */
+    /// True if this is the active profile (read-only).
     #[zbus(property)]
     async fn is_active(&self) -> bool {
-        self.info.read().await.is_active
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .is_some_and(|p| p.is_active)
     }
 
-    /* True if this profile has uncommitted changes. */
+    /// True if this profile has uncommitted changes.
     #[zbus(property)]
     async fn is_dirty(&self) -> bool {
-        self.info.read().await.is_dirty
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .is_some_and(|p| p.is_dirty)
     }
 
-    /* Object paths to this profile's resolutions. */
+    /// Object paths to this profile's resolutions.
     #[zbus(property)]
     async fn resolutions(&self) -> Vec<ObjectPath<'static>> {
-        let info = self.info.read().await;
-        info.resolutions
+        let info = self.device_info.read().await;
+        let Some(profile) = info.find_profile(self.profile_id) else {
+            return Vec::new();
+        };
+        profile
+            .resolutions
             .iter()
             .filter_map(|r| {
-                let path = format!("{}/p{}/r{}", self.device_path, info.index, r.index);
-                ObjectPath::try_from(path).ok()
+                ObjectPath::try_from(format!(
+                    "{}/p{}/r{}",
+                    self.device_path, self.profile_id, r.index
+                ))
+                .ok()
             })
             .collect()
     }
 
-    /* Object paths to this profile's buttons. */
+    /// Object paths to this profile's buttons.
     #[zbus(property)]
     async fn buttons(&self) -> Vec<ObjectPath<'static>> {
-        let info = self.info.read().await;
-        info.buttons
+        let info = self.device_info.read().await;
+        let Some(profile) = info.find_profile(self.profile_id) else {
+            return Vec::new();
+        };
+        profile
+            .buttons
             .iter()
             .filter_map(|b| {
-                let path = format!("{}/p{}/b{}", self.device_path, info.index, b.index);
-                ObjectPath::try_from(path).ok()
+                ObjectPath::try_from(format!(
+                    "{}/p{}/b{}",
+                    self.device_path, self.profile_id, b.index
+                ))
+                .ok()
             })
             .collect()
     }
 
-    /* Object paths to this profile's LEDs. */
+    /// Object paths to this profile's LEDs.
     #[zbus(property)]
     async fn leds(&self) -> Vec<ObjectPath<'static>> {
-        let info = self.info.read().await;
-        info.leds
+        let info = self.device_info.read().await;
+        let Some(profile) = info.find_profile(self.profile_id) else {
+            return Vec::new();
+        };
+        profile
+            .leds
             .iter()
             .filter_map(|l| {
-                let path = format!("{}/p{}/l{}", self.device_path, info.index, l.index);
-                ObjectPath::try_from(path).ok()
+                ObjectPath::try_from(format!(
+                    "{}/p{}/l{}",
+                    self.device_path, self.profile_id, l.index
+                ))
+                .ok()
             })
             .collect()
     }
 
-    /* Sensor angle snapping (-1 = unsupported, 0 = off, 1 = on). */
+    /// Sensor angle snapping (-1 = unsupported, 0 = off, 1 = on).
     #[zbus(property)]
     async fn angle_snapping(&self) -> i32 {
-        self.info.read().await.angle_snapping
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.angle_snapping)
+            .unwrap_or(-1)
     }
 
     #[zbus(property)]
     async fn set_angle_snapping(&self, value: i32) {
-        let mut info = self.info.write().await;
-        info.angle_snapping = value;
-        info.is_dirty = true;
+        let mut info = self.device_info.write().await;
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.angle_snapping = value;
+            profile.is_dirty = true;
+        }
     }
 
-    /* Button debounce time in ms (-1 = unsupported). */
+    /// Button debounce time in ms (-1 = unsupported).
     #[zbus(property)]
     async fn debounce(&self) -> i32 {
-        self.info.read().await.debounce
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.debounce)
+            .unwrap_or(-1)
     }
 
     #[zbus(property)]
     async fn set_debounce(&self, value: i32) {
-        let mut info = self.info.write().await;
-        info.debounce = value;
-        info.is_dirty = true;
+        let mut info = self.device_info.write().await;
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.debounce = value;
+            profile.is_dirty = true;
+        }
     }
 
-    /* Permitted debounce time values. */
+    /// Permitted debounce time values.
     #[zbus(property)]
     async fn debounces(&self) -> Vec<u32> {
-        self.info.read().await.debounces.clone()
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.debounces.clone())
+            .unwrap_or_default()
     }
 
-    /* Report rate in Hz. */
+    /// Report rate in Hz.
     #[zbus(property)]
     async fn report_rate(&self) -> u32 {
-        self.info.read().await.report_rate
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.report_rate)
+            .unwrap_or(0)
     }
 
     #[zbus(property)]
     async fn set_report_rate(&self, rate: u32) {
-        let mut info = self.info.write().await;
-        info.report_rate = rate;
-        info.is_dirty = true;
+        let mut info = self.device_info.write().await;
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.report_rate = rate;
+            profile.is_dirty = true;
+        }
     }
 
-    /* Permitted report rate values. */
+    /// Permitted report rate values.
     #[zbus(property)]
     async fn report_rates(&self) -> Vec<u32> {
-        self.info.read().await.report_rates.clone()
+        let info = self.device_info.read().await;
+        info.find_profile(self.profile_id)
+            .map(|p| p.report_rates.clone())
+            .unwrap_or_default()
     }
 
-    /* Set this profile as the active profile. */
+    /// Set this profile as the active profile.
+    ///
+    /// Deactivates all other profiles on the same device first.
     async fn set_active(&self) {
-        let mut info = self.info.write().await;
-        info.is_active = true;
-        info.is_dirty = true;
-        /* TODO: Deactivate other profiles via the device actor */
-        tracing::info!("Profile {} set as active", info.index);
+        let mut info = self.device_info.write().await;
+        for profile in &mut info.profiles {
+            profile.is_active = false;
+        }
+        if let Some(profile) = info.find_profile_mut(self.profile_id) {
+            profile.is_active = true;
+            profile.is_dirty = true;
+        }
+        tracing::info!("Profile {} set as active", self.profile_id);
     }
 }

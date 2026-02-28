@@ -52,600 +52,16 @@ const STEELSERIES_BUTTON_WHEEL_DOWN: u8 = 0x32;
 const STEELSERIES_BUTTON_KEY: u8 = 0x10;
 const STEELSERIES_BUTTON_KBD: u8 = 0x51;
 
+/* Button payload stride per button in the report (bytes) */
+const STEELSERIES_BUTTON_SIZE_SENSEIRAW: usize = 3;
+const STEELSERIES_BUTTON_SIZE_STANDARD: usize = 5;
+
+/* DPI scaling: hardware stores (dpi / 100) - 1; marker byte used by V2/V3 */
+const STEELSERIES_DPI_MAGIC_MARKER: u8 = 0x42;
+
 /* ---------------------------------------------------------------------- */
 /* Driver Instance                                                        */
 /* ---------------------------------------------------------------------- */
-
-/* ---------------------------------------------------------------------- */
-/* Payload Structures                                                     */
-/* ---------------------------------------------------------------------- */
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesDpiReportV1 {
-    pub report_id: u8,
-    pub res_id: u8,
-    pub dpi_scaled: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-}
-
-impl SteelseriesDpiReportV1 {
-    pub fn new(res_id: u8, dpi_scaled: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_DPI_SHORT,
-            res_id,
-            dpi_scaled,
-            padding: [0u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-        }
-    }
-
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf[1] = self.res_id;
-        buf[2] = self.dpi_scaled;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesDpiReportV2 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub res_id: u8,
-    pub dpi_scaled: u8,
-    pub padding2: [u8; 2],
-    pub magic_42: u8,
-    pub padding3: [u8; STEELSERIES_REPORT_SIZE - 7],
-}
-
-impl SteelseriesDpiReportV2 {
-    pub fn new(res_id: u8, dpi_scaled: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_DPI,
-            padding1: 0,
-            res_id,
-            dpi_scaled,
-            padding2: [0u8; 2],
-            magic_42: 0x42,
-            padding3: [0u8; STEELSERIES_REPORT_SIZE - 7],
-        }
-    }
-
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[2] = self.res_id;
-        buf[3] = self.dpi_scaled;
-        buf[6] = self.magic_42;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesDpiReportV3 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub res_id: u8,
-    pub dpi_scaled: u8,
-    pub padding2: u8,
-    pub magic_42: u8,
-    pub padding3: [u8; STEELSERIES_REPORT_SIZE - 6],
-}
-
-impl SteelseriesDpiReportV3 {
-    pub fn new(res_id: u8, dpi_scaled: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_DPI_PROTOCOL3,
-            padding1: 0,
-            res_id,
-            dpi_scaled,
-            padding2: 0,
-            magic_42: 0x42,
-            padding3: [0u8; STEELSERIES_REPORT_SIZE - 6],
-        }
-    }
-
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[2] = self.res_id;
-        buf[3] = self.dpi_scaled;
-        buf[5] = self.magic_42;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesDpiReportV4 {
-    pub report_id: u8,
-    pub res_id: u8,
-    pub dpi_scaled: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-}
-
-impl SteelseriesDpiReportV4 {
-    pub fn new(res_id: u8, dpi_scaled: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_DPI_PROTOCOL4,
-            res_id,
-            dpi_scaled,
-            padding: [0u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-        }
-    }
-
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf[1] = self.res_id;
-        buf[2] = self.dpi_scaled;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesReportRateV1 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub rate_val: u8,
-    pub padding2: [u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-}
-
-impl SteelseriesReportRateV1 {
-    pub fn new(rate_val: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_REPORT_RATE_SHORT,
-            padding1: 0,
-            rate_val,
-            padding2: [0u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf[2] = self.rate_val;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesReportRateV2 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub rate_val: u8,
-    pub padding2: [u8; STEELSERIES_REPORT_SIZE - 3],
-}
-
-impl SteelseriesReportRateV2 {
-    pub fn new(rate_val: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_REPORT_RATE,
-            padding1: 0,
-            rate_val,
-            padding2: [0u8; STEELSERIES_REPORT_SIZE - 3],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[2] = self.rate_val;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesReportRateV3 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub rate_val: u8,
-    pub padding2: [u8; STEELSERIES_REPORT_SIZE - 3],
-}
-
-impl SteelseriesReportRateV3 {
-    pub fn new(rate_val: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_REPORT_RATE_PROTOCOL3,
-            padding1: 0,
-            rate_val,
-            padding2: [0u8; STEELSERIES_REPORT_SIZE - 3],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[2] = self.rate_val;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesReportRateV4 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub rate_val: u8,
-    pub padding2: [u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-}
-
-impl SteelseriesReportRateV4 {
-    pub fn new(rate_val: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_REPORT_RATE_PROTOCOL4,
-            padding1: 0,
-            rate_val,
-            padding2: [0u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf[2] = self.rate_val;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesSaveV1 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 1],
-}
-
-impl SteelseriesSaveV1 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_SAVE_SHORT,
-            padding: [0u8; STEELSERIES_REPORT_SIZE_SHORT - 1],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesSaveV2 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE - 1],
-}
-
-impl SteelseriesSaveV2 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_SAVE,
-            padding: [0; 63],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesSaveV3 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE - 1],
-}
-
-impl SteelseriesSaveV3 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_SAVE_PROTOCOL3,
-            padding: [0; 63],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesFirmwareRequestV1 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 1],
-}
-
-impl SteelseriesFirmwareRequestV1 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_FIRMWARE_PROTOCOL1,
-            padding: [0; 31],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesFirmwareRequestV2 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE - 1],
-}
-
-impl SteelseriesFirmwareRequestV2 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_FIRMWARE_PROTOCOL2,
-            padding: [0; 63],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesFirmwareRequestV3 {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE - 1],
-}
-
-impl SteelseriesFirmwareRequestV3 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_FIRMWARE_PROTOCOL3,
-            padding: [0; 63],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesLedEffectReportV1 {
-    pub report_id: u8,
-    pub led_id: u8,
-    pub effect: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 3],
-}
-impl SteelseriesLedEffectReportV1 {
-    pub fn new(led_id: u8, effect: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_LED_EFFECT_SHORT,
-            led_id,
-            effect,
-            padding: [0; 29],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut b = [0; 32];
-        b[0] = self.report_id;
-        b[1] = self.led_id;
-        b[2] = self.effect;
-        b
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesLedColorReportV1 {
-    pub report_id: u8,
-    pub led_id: u8,
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE_SHORT - 5],
-}
-impl SteelseriesLedColorReportV1 {
-    pub fn new(led_id: u8, r: u8, g: u8, b: u8) -> Self {
-        Self {
-            report_id: STEELSERIES_ID_LED_COLOR_SHORT,
-            led_id,
-            r,
-            g,
-            b,
-            padding: [0; 27],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE_SHORT] {
-        let mut b = [0; 32];
-        b[0] = self.report_id;
-        b[1] = self.led_id;
-        b[2] = self.r;
-        b[3] = self.g;
-        b[4] = self.b;
-        b
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct SteelseriesLedPoint {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    pub pos: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesLedReportV2 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub led_id: u8,
-    pub duration: [u8; 2],
-    pub padding2: [u8; 14],
-    pub disable_repeat: u8,
-    pub padding3: [u8; 7],
-    pub npoints: u8,
-    pub points: [SteelseriesLedPoint; 9],
-}
-impl SteelseriesLedReportV2 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_LED,
-            padding1: 0,
-            led_id: 0,
-            duration: [0; 2],
-            padding2: [0; 14],
-            disable_repeat: 0,
-            padding3: [0; 7],
-            npoints: 0,
-            points: [SteelseriesLedPoint::default(); 9],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[1] = self.padding1;
-        buf[2] = self.led_id;
-        buf[3..5].copy_from_slice(&self.duration);
-        buf[5..19].copy_from_slice(&self.padding2);
-        buf[19] = self.disable_repeat;
-        buf[20..27].copy_from_slice(&self.padding3);
-        buf[27] = self.npoints;
-
-        let mut offset = 28;
-        for p in &self.points {
-            buf[offset] = p.r;
-            buf[offset + 1] = p.g;
-            buf[offset + 2] = p.b;
-            buf[offset + 3] = p.pos;
-            offset += 4;
-        }
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesLedReportV3 {
-    pub report_id: u8,
-    pub padding1: u8,
-    pub led_id: u8,
-    pub padding2: [u8; 4],
-    pub led_id2: u8,
-    pub duration: [u8; 2],
-    pub padding3: [u8; 14],
-    pub disable_repeat: u8,
-    pub padding4: [u8; 4],
-    pub npoints: u8,
-    pub points: [SteelseriesLedPoint; 8],
-    pub padding5: [u8; 2],
-}
-impl SteelseriesLedReportV3 {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_LED_PROTOCOL3,
-            padding1: 0,
-            led_id: 0,
-            padding2: [0; 4],
-            led_id2: 0,
-            duration: [0; 2],
-            padding3: [0; 14],
-            disable_repeat: 0,
-            padding4: [0; 4],
-            npoints: 0,
-            points: [SteelseriesLedPoint::default(); 8],
-            padding5: [0; 2],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        buf[0] = self.report_id;
-        buf[1] = self.padding1;
-        buf[2] = self.led_id;
-        buf[3..7].copy_from_slice(&self.padding2);
-        buf[7] = self.led_id2;
-        buf[8..10].copy_from_slice(&self.duration);
-        buf[10..24].copy_from_slice(&self.padding3);
-        buf[24] = self.disable_repeat;
-        buf[25..29].copy_from_slice(&self.padding4);
-        buf[29] = self.npoints;
-
-        let mut offset = 30;
-        for p in &self.points {
-            buf[offset] = p.r;
-            buf[offset + 1] = p.g;
-            buf[offset + 2] = p.b;
-            buf[offset + 3] = p.pos;
-            offset += 4;
-        }
-
-        buf[62..64].copy_from_slice(&self.padding5);
-        buf
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesButtonReport {
-    pub report_id: u8,
-    pub padding: u8,
-    pub buttons: [u8; 260],
-}
-impl SteelseriesButtonReport {
-    pub fn new() -> Self {
-        Self {
-            report_id: STEELSERIES_ID_BUTTONS,
-            padding: 0,
-            buttons: [0; 260],
-        }
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_LONG_SIZE] {
-        let mut b = [0; 262];
-        b[0] = self.report_id;
-        b[1] = self.padding;
-        b[2..262].copy_from_slice(&self.buttons);
-        b
-    }
-    pub fn write_idx(&mut self, idx: usize, val: u8) {
-        if idx >= 2 && idx < 262 {
-            self.buttons[idx - 2] = val;
-        }
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct SteelseriesSettingsRequest {
-    pub report_id: u8,
-    pub padding: [u8; STEELSERIES_REPORT_SIZE - 1],
-}
-impl SteelseriesSettingsRequest {
-    pub fn new(version: u8) -> Option<Self> {
-        let id = match version {
-            2 => STEELSERIES_ID_SETTINGS,
-            3 => STEELSERIES_ID_SETTINGS_PROTOCOL3,
-            _ => return None,
-        };
-        Some(Self {
-            report_id: id,
-            padding: [0; 63],
-        })
-    }
-    pub fn into_bytes(self) -> [u8; STEELSERIES_REPORT_SIZE] {
-        let mut buf = [0; 64];
-        buf[0] = self.report_id;
-        buf
-    }
-}
 
 pub struct SteelseriesDriver {
     version: u8,
@@ -749,7 +165,9 @@ impl DeviceDriver for SteelseriesDriver {
             }
 
             /* Attempt to override defaults by reading active hardware settings */
-            let _ = self.read_settings(io, &mut profile).await;
+            if let Err(e) = self.read_settings(io, &mut profile).await {
+                warn!("SteelSeries: failed to read hardware settings: {e}");
+            }
 
             info.profiles.push(profile);
         }
@@ -798,6 +216,10 @@ impl DeviceDriver for SteelseriesDriver {
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/* Helper methods – all payloads built as explicit byte arrays            */
+/* ---------------------------------------------------------------------- */
+
 impl SteelseriesDriver {
     async fn write_dpi(
         &self,
@@ -810,27 +232,38 @@ impl SteelseriesDriver {
             crate::device::Dpi::Unknown => 800,
         };
         let scaled = (dpi_val / 100).saturating_sub(1) as u8;
+        let res_id = res.index as u8 + 1;
 
         match self.version {
             1 => {
-                let payload = SteelseriesDpiReportV1::new(res.index as u8 + 1, scaled);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&payload.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_DPI_SHORT;
+                buf[1] = res_id;
+                buf[2] = scaled;
+                io.write_report(&buf).await
             }
             2 => {
-                let payload = SteelseriesDpiReportV2::new(res.index as u8 + 1, scaled);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&payload.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_DPI;
+                buf[2] = res_id;
+                buf[3] = scaled;
+                buf[6] = STEELSERIES_DPI_MAGIC_MARKER;
+                io.write_report(&buf).await
             }
             3 => {
-                let payload = SteelseriesDpiReportV3::new(res.index as u8 + 1, scaled);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&payload.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_DPI_PROTOCOL3;
+                buf[2] = res_id;
+                buf[3] = scaled;
+                buf[5] = STEELSERIES_DPI_MAGIC_MARKER;
+                io.write_report(&buf).await
             }
             4 => {
-                let payload = SteelseriesDpiReportV4::new(res.index as u8 + 1, scaled);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&payload.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_DPI_PROTOCOL4;
+                buf[1] = res_id;
+                buf[2] = scaled;
+                io.write_report(&buf).await
             }
             _ => Ok(()),
         }
@@ -842,7 +275,8 @@ impl SteelseriesDriver {
         profile: &crate::device::ProfileInfo,
         info: &DeviceInfo,
     ) -> Result<()> {
-        let mut report = SteelseriesButtonReport::new();
+        let mut buf = [0u8; STEELSERIES_REPORT_LONG_SIZE];
+        buf[0] = STEELSERIES_ID_BUTTONS;
 
         let is_senseiraw = info
             .driver_config
@@ -850,7 +284,7 @@ impl SteelseriesDriver {
             .iter()
             .any(|q| q == "STEELSERIES_QUIRK_SENSEIRAW");
 
-        let button_size = if is_senseiraw { 3 } else { 5 };
+        let button_size = if is_senseiraw { STEELSERIES_BUTTON_SIZE_SENSEIRAW } else { STEELSERIES_BUTTON_SIZE_STANDARD };
         let report_size = if is_senseiraw {
             STEELSERIES_REPORT_SIZE_SHORT
         } else {
@@ -865,18 +299,27 @@ impl SteelseriesDriver {
 
             match button.action_type {
                 crate::device::ActionType::Button => {
-                    report.write_idx(idx, button.mapping_value as u8);
+                    buf[idx] = button.mapping_value as u8;
                 }
                 crate::device::ActionType::Key => {
-                    let key = button.mapping_value;
-                    let hid_usage = (key % 256) as u8;
+                    let hid_usage = (button.mapping_value % 256) as u8;
 
                     if is_senseiraw {
-                        report.write_idx(idx, STEELSERIES_BUTTON_KEY);
-                        report.write_idx(idx + 1, hid_usage);
+                        buf[idx] = STEELSERIES_BUTTON_KEY;
+                        if idx + 1 < report_size {
+                            buf[idx + 1] = hid_usage;
+                        } else {
+                            warn!("SteelSeries: button {} key data truncated (offset {} exceeds report size {})",
+                                  button.index, idx + 1, report_size);
+                        }
                     } else {
-                        report.write_idx(idx, STEELSERIES_BUTTON_KBD);
-                        report.write_idx(idx + 1, hid_usage);
+                        buf[idx] = STEELSERIES_BUTTON_KBD;
+                        if idx + 1 < report_size {
+                            buf[idx + 1] = hid_usage;
+                        } else {
+                            warn!("SteelSeries: button {} key data truncated (offset {} exceeds report size {})",
+                                  button.index, idx + 1, report_size);
+                        }
                     }
                 }
                 crate::device::ActionType::Macro => {
@@ -918,70 +361,66 @@ impl SteelseriesDriver {
                     }
 
                     if is_senseiraw {
-                        report.write_idx(idx, STEELSERIES_BUTTON_KEY);
-                        report.write_idx(idx + 1, final_key);
+                        buf[idx] = STEELSERIES_BUTTON_KEY;
+                        if idx + 1 < report_size {
+                            buf[idx + 1] = final_key;
+                        } else {
+                            warn!("SteelSeries: button {} macro key truncated (offset {} exceeds report size {})",
+                                  button.index, idx + 1, report_size);
+                        }
                     } else {
-                        report.write_idx(idx, STEELSERIES_BUTTON_KBD);
+                        buf[idx] = STEELSERIES_BUTTON_KBD;
                         let mut cursor = idx;
 
                         /* Maximum of 3 modifiers allowed by SteelSeries protocol natively */
-                        if (modifiers & 0x01) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE0);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x02) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE1);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x04) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE2);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x08) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE3);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x10) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE4);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x20) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE5);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x40) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE6);
-                            cursor += 1;
-                        }
-                        if (modifiers & 0x80) != 0 && cursor - idx < 3 {
-                            report.write_idx(cursor + 1, 0xE7);
-                            cursor += 1;
+                        static MODIFIER_TABLE: [(u8, u8); 8] = [
+                            (0x01, 0xE0),
+                            (0x02, 0xE1),
+                            (0x04, 0xE2),
+                            (0x08, 0xE3),
+                            (0x10, 0xE4),
+                            (0x20, 0xE5),
+                            (0x40, 0xE6),
+                            (0x80, 0xE7),
+                        ];
+                        for &(mask, code) in &MODIFIER_TABLE {
+                            if (modifiers & mask) != 0 && cursor - idx < 3 {
+                                if cursor + 1 < report_size {
+                                    buf[cursor + 1] = code;
+                                } else {
+                                    warn!("SteelSeries: button {} modifier truncated (offset {} exceeds report size {})",
+                                          button.index, cursor + 1, report_size);
+                                }
+                                cursor += 1;
+                            }
                         }
 
-                        report.write_idx(cursor + 1, final_key);
+                        if cursor + 1 < report_size {
+                            buf[cursor + 1] = final_key;
+                        } else {
+                            warn!("SteelSeries: button {} macro final key truncated (offset {} exceeds report size {})",
+                                  button.index, cursor + 1, report_size);
+                        }
                     }
                 }
                 crate::device::ActionType::Special => {
                     /* Simple map for mapping_value -> RES_CYCLE etc... */
                     match button.mapping_value {
-                        1 => report.write_idx(idx, STEELSERIES_BUTTON_RES_CYCLE),
-                        2 => report.write_idx(idx, STEELSERIES_BUTTON_WHEEL_UP),
-                        3 => report.write_idx(idx, STEELSERIES_BUTTON_WHEEL_DOWN),
-                        _ => report.write_idx(idx, STEELSERIES_BUTTON_OFF),
+                        1 => buf[idx] = STEELSERIES_BUTTON_RES_CYCLE,
+                        2 => buf[idx] = STEELSERIES_BUTTON_WHEEL_UP,
+                        3 => buf[idx] = STEELSERIES_BUTTON_WHEEL_DOWN,
+                        _ => buf[idx] = STEELSERIES_BUTTON_OFF,
                     }
                 }
-                _ => report.write_idx(idx, STEELSERIES_BUTTON_OFF),
+                _ => buf[idx] = STEELSERIES_BUTTON_OFF,
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let b = report.into_bytes();
         if self.version == 3 {
-            io.set_feature_report(&b[..report_size])?;
+            io.set_feature_report(&buf[..report_size])?;
             Ok(())
         } else {
-            io.write_report(&b[..report_size]).await
+            io.write_report(&buf[..report_size]).await
         }
     }
 
@@ -990,24 +429,28 @@ impl SteelseriesDriver {
 
         match self.version {
             1 => {
-                let report = SteelseriesReportRateV1::new(rate_val);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_REPORT_RATE_SHORT;
+                buf[2] = rate_val;
+                io.write_report(&buf).await
             }
             2 => {
-                let report = SteelseriesReportRateV2::new(rate_val);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_REPORT_RATE;
+                buf[2] = rate_val;
+                io.write_report(&buf).await
             }
             3 => {
-                let report = SteelseriesReportRateV3::new(rate_val);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_REPORT_RATE_PROTOCOL3;
+                buf[2] = rate_val;
+                io.write_report(&buf).await
             }
             4 => {
-                let report = SteelseriesReportRateV4::new(rate_val);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_REPORT_RATE_PROTOCOL4;
+                buf[2] = rate_val;
+                io.write_report(&buf).await
             }
             _ => Ok(()),
         }
@@ -1038,118 +481,160 @@ impl SteelseriesDriver {
             _ => return Ok(()),
         };
 
-        let effect_report = SteelseriesLedEffectReportV1::new(led.index as u8 + 1, effect);
+        /* Effect report: [report_id, led_id, effect, ...padding] */
+        let mut effect_buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+        effect_buf[0] = STEELSERIES_ID_LED_EFFECT_SHORT;
+        effect_buf[1] = led.index as u8 + 1;
+        effect_buf[2] = effect;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        io.write_report(&effect_report.into_bytes()).await?;
+        io.write_report(&effect_buf).await?;
 
-        let color_report = SteelseriesLedColorReportV1::new(
-            led.index as u8 + 1,
-            led.color.red as u8,
-            led.color.green as u8,
-            led.color.blue as u8,
-        );
+        /* Color report: [report_id, led_id, r, g, b, ...padding] */
+        let mut color_buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+        color_buf[0] = STEELSERIES_ID_LED_COLOR_SHORT;
+        color_buf[1] = led.index as u8 + 1;
+        color_buf[2] = led.color.red as u8;
+        color_buf[3] = led.color.green as u8;
+        color_buf[4] = led.color.blue as u8;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        io.write_report(&color_report.into_bytes()).await
+        io.write_report(&color_buf).await
     }
 
     async fn write_led_v2(&self, io: &mut DeviceIo, led: &crate::device::LedInfo) -> Result<()> {
-        let mut report = SteelseriesLedReportV2::new();
-        report.led_id = led.index as u8;
+        /* V2 LED report envelope (64 bytes):
+         *   [0]      = report_id
+         *   [1]      = padding
+         *   [2]      = led_id
+         *   [3..5]   = duration (u16 LE)
+         *   [5..19]  = padding
+         *   [19]     = disable_repeat
+         *   [20..27] = padding
+         *   [27]     = npoints
+         *   [28..]   = points (4 bytes each: r, g, b, pos) */
+        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+        buf[0] = STEELSERIES_ID_LED;
+        buf[2] = led.index as u8;
 
         if matches!(
             led.mode,
             crate::device::LedMode::Off | crate::device::LedMode::Solid
         ) {
-            report.disable_repeat = 0x01;
+            buf[19] = 0x01;
         }
 
-        let mut npoints = 0;
+        let mut npoints = 0usize;
         let c1 = &led.color;
         let off = led.mode == crate::device::LedMode::Off;
 
-        report.points[npoints].r = if off { 0 } else { c1.red as u8 };
-        report.points[npoints].g = if off { 0 } else { c1.green as u8 };
-        report.points[npoints].b = if off { 0 } else { c1.blue as u8 };
-        report.points[npoints].pos = 0x00;
+        /* Point 0 */
+        let p = 28 + npoints * 4;
+        buf[p] = if off { 0 } else { c1.red as u8 };
+        buf[p + 1] = if off { 0 } else { c1.green as u8 };
+        buf[p + 2] = if off { 0 } else { c1.blue as u8 };
+        buf[p + 3] = 0x00;
         npoints += 1;
 
         if led.mode == crate::device::LedMode::Breathing {
-            report.points[npoints].r = c1.red as u8;
-            report.points[npoints].g = c1.green as u8;
-            report.points[npoints].b = c1.blue as u8;
-            report.points[npoints].pos = 0x7F;
+            /* Point 1: full color at midpoint */
+            let p = 28 + npoints * 4;
+            buf[p] = c1.red as u8;
+            buf[p + 1] = c1.green as u8;
+            buf[p + 2] = c1.blue as u8;
+            buf[p + 3] = 0x7F;
             npoints += 1;
 
-            report.points[npoints].pos = 0x7F; // Black out
+            /* Point 2: black at midpoint */
+            let p = 28 + npoints * 4;
+            buf[p + 3] = 0x7F;
             npoints += 1;
         }
 
-        report.npoints = npoints as u8;
+        buf[27] = npoints as u8;
         let d = std::cmp::max(npoints as u16 * 330, led.effect_duration as u16);
-        report.duration = d.to_le_bytes();
+        buf[3..5].copy_from_slice(&d.to_le_bytes());
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        io.write_report(&report.into_bytes()).await
+        io.write_report(&buf).await
     }
 
     async fn write_led_v3(&self, io: &mut DeviceIo, led: &crate::device::LedInfo) -> Result<()> {
-        let mut report = SteelseriesLedReportV3::new();
-        report.led_id = led.index as u8;
-        report.led_id2 = led.index as u8;
+        /* V3 LED report envelope (64 bytes):
+         *   [0]      = report_id
+         *   [1]      = padding
+         *   [2]      = led_id
+         *   [3..7]   = padding (4 bytes)
+         *   [7]      = led_id2
+         *   [8..10]  = duration (u16 LE)
+         *   [10..24] = padding (14 bytes)
+         *   [24]     = disable_repeat
+         *   [25..29] = padding (4 bytes)
+         *   [29]     = npoints
+         *   [30..]   = points (4 bytes each: r, g, b, pos), max 8
+         *   [62..64] = padding (2 bytes) */
+        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+        buf[0] = STEELSERIES_ID_LED_PROTOCOL3;
+        buf[2] = led.index as u8;
+        buf[7] = led.index as u8;
 
         if matches!(
             led.mode,
             crate::device::LedMode::Off | crate::device::LedMode::Solid
         ) {
-            report.disable_repeat = 0x01;
+            buf[24] = 0x01;
         }
 
-        let mut npoints = 0;
+        let mut npoints = 0usize;
         let c1 = &led.color;
         let off = led.mode == crate::device::LedMode::Off;
 
-        report.points[npoints].r = if off { 0 } else { c1.red as u8 };
-        report.points[npoints].g = if off { 0 } else { c1.green as u8 };
-        report.points[npoints].b = if off { 0 } else { c1.blue as u8 };
-        report.points[npoints].pos = 0x00;
+        /* Point 0 */
+        let p = 30 + npoints * 4;
+        buf[p] = if off { 0 } else { c1.red as u8 };
+        buf[p + 1] = if off { 0 } else { c1.green as u8 };
+        buf[p + 2] = if off { 0 } else { c1.blue as u8 };
+        buf[p + 3] = 0x00;
         npoints += 1;
 
         if led.mode == crate::device::LedMode::Breathing {
-            report.points[npoints].r = c1.red as u8;
-            report.points[npoints].g = c1.green as u8;
-            report.points[npoints].b = c1.blue as u8;
-            report.points[npoints].pos = 0x7F;
+            /* Point 1 */
+            let p = 30 + npoints * 4;
+            buf[p] = c1.red as u8;
+            buf[p + 1] = c1.green as u8;
+            buf[p + 2] = c1.blue as u8;
+            buf[p + 3] = 0x7F;
             npoints += 1;
 
-            report.points[npoints].pos = 0x7F; // Black out
+            /* Point 2 */
+            let p = 30 + npoints * 4;
+            buf[p + 3] = 0x7F;
             npoints += 1;
         }
 
-        report.npoints = npoints as u8;
+        buf[29] = npoints as u8;
         let d = std::cmp::max(npoints as u16 * 330, led.effect_duration as u16);
-        report.duration = d.to_le_bytes();
+        buf[8..10].copy_from_slice(&d.to_le_bytes());
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        io.set_feature_report(&report.into_bytes())?;
+        io.set_feature_report(&buf)?;
         Ok(())
     }
 
     async fn write_save(&self, io: &mut DeviceIo) -> Result<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
         match self.version {
             1 => {
-                let report = SteelseriesSaveV1::new();
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_SAVE_SHORT;
+                io.write_report(&buf).await
             }
             2 => {
-                let report = SteelseriesSaveV2::new();
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_SAVE;
+                io.write_report(&buf).await
             }
             3 | 4 => {
-                let report = SteelseriesSaveV3::new();
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                io.write_report(&report.into_bytes()).await
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_SAVE_PROTOCOL3;
+                io.write_report(&buf).await
             }
             _ => Ok(()),
         }
@@ -1158,19 +643,19 @@ impl SteelseriesDriver {
     async fn read_firmware_version(&self, io: &mut DeviceIo) -> Result<String> {
         match self.version {
             1 => {
-                let req = SteelseriesFirmwareRequestV1::new();
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&req.into_bytes()).await?;
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE_SHORT];
+                buf[0] = STEELSERIES_ID_FIRMWARE_PROTOCOL1;
+                io.write_report(&buf).await?;
             }
             2 => {
-                let req = SteelseriesFirmwareRequestV2::new();
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&req.into_bytes()).await?;
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_FIRMWARE_PROTOCOL2;
+                io.write_report(&buf).await?;
             }
             3 => {
-                let req = SteelseriesFirmwareRequestV3::new();
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                io.write_report(&req.into_bytes()).await?;
+                let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+                buf[0] = STEELSERIES_ID_FIRMWARE_PROTOCOL3;
+                io.write_report(&buf).await?;
             }
             _ => return Ok(String::new()),
         }
@@ -1199,45 +684,50 @@ impl SteelseriesDriver {
         io: &mut DeviceIo,
         profile: &mut crate::device::ProfileInfo,
     ) -> Result<()> {
-        if let Some(req) = SteelseriesSettingsRequest::new(self.version) {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            io.write_report(&req.into_bytes()).await?;
+        let settings_id = match self.version {
+            2 => STEELSERIES_ID_SETTINGS,
+            3 => STEELSERIES_ID_SETTINGS_PROTOCOL3,
+            _ => return Ok(()),
+        };
 
-            let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-            if let Ok(Ok(n)) = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                io.read_report(&mut buf),
-            )
-            .await
-            {
-                if n < 2 {
-                    return Ok(());
+        let mut req = [0u8; STEELSERIES_REPORT_SIZE];
+        req[0] = settings_id;
+        io.write_report(&req).await?;
+
+        let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
+        if let Ok(Ok(n)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            io.read_report(&mut buf),
+        )
+        .await
+        {
+            if n < 2 {
+                return Ok(());
+            }
+
+            if self.version == 2 {
+                let active_resolution = buf.get(1).copied().unwrap_or(0).saturating_sub(1);
+                for res in &mut profile.resolutions {
+                    res.is_active = res.index == active_resolution as u32;
+                    let dpi_idx = 2 + res.index as usize * 2;
+                    if dpi_idx < n {
+                        let dpi_val = 100 * (1 + buf.get(dpi_idx).copied().unwrap_or(0) as u32);
+                        res.dpi = crate::device::Dpi::Unified(dpi_val);
+                    }
                 }
 
-                if self.version == 2 {
-                    let active_resolution = buf.get(1).copied().unwrap_or(0).saturating_sub(1);
-                    for res in &mut profile.resolutions {
-                        res.is_active = res.index == active_resolution as u32;
-                        let dpi_idx = 2 + res.index as usize * 2;
-                        if dpi_idx < n {
-                            let dpi_val = 100 * (1 + buf.get(dpi_idx).copied().unwrap_or(0) as u32);
-                            res.dpi = crate::device::Dpi::Unified(dpi_val);
-                        }
+                for led in &mut profile.leds {
+                    let offset = 6 + led.index as usize * 3;
+                    if offset + 2 < n {
+                        led.color.red = buf.get(offset).copied().unwrap_or(0) as u32;
+                        led.color.green = buf.get(offset + 1).copied().unwrap_or(0) as u32;
+                        led.color.blue = buf.get(offset + 2).copied().unwrap_or(0) as u32;
                     }
-
-                    for led in &mut profile.leds {
-                        let offset = 6 + led.index as usize * 3;
-                        if offset + 2 < n {
-                            led.color.red = buf.get(offset).copied().unwrap_or(0) as u32;
-                            led.color.green = buf.get(offset + 1).copied().unwrap_or(0) as u32;
-                            led.color.blue = buf.get(offset + 2).copied().unwrap_or(0) as u32;
-                        }
-                    }
-                } else if self.version == 3 {
-                    let active_resolution = buf.get(0).copied().unwrap_or(0).saturating_sub(1);
-                    for res in &mut profile.resolutions {
-                        res.is_active = res.index == active_resolution as u32;
-                    }
+                }
+            } else if self.version == 3 {
+                let active_resolution = buf.get(0).copied().unwrap_or(0).saturating_sub(1);
+                for res in &mut profile.resolutions {
+                    res.is_active = res.index == active_resolution as u32;
                 }
             }
         }

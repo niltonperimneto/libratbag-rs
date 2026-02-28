@@ -26,7 +26,11 @@ const ROCCAT_MAX_RETRY_READY: usize = 10;
 #[allow(dead_code)]
 const ROCCAT_MAX_MACRO_LENGTH: usize = 500;
 
-#[repr(C, packed)]
+/* Each Roccat button mapping is a 3-byte stride: [action, param1, param2] */
+const ROCCAT_BUTTON_STRIDE: usize = 3;
+/* Maximum button index (0-based). 24 buttons × 3 bytes = 72 = buttons array len */
+const ROCCAT_BUTTON_INDEX_MAX: usize = 24;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RoccatSettingsReport {
     pub report_id: u8,
@@ -92,7 +96,6 @@ impl RoccatSettingsReport {
     }
 }
 
-#[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct RoccatProfileReport {
     pub report_id: u8,
@@ -127,7 +130,6 @@ impl RoccatProfileReport {
 }
 
 #[allow(dead_code)]
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct RoccatMacroEvent {
     pub keycode: u8,
@@ -136,7 +138,6 @@ pub struct RoccatMacroEvent {
 }
 
 #[allow(dead_code)]
-#[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct RoccatMacro {
     pub report_id: u8,
@@ -310,8 +311,9 @@ impl RoccatDriver {
     /* yields to the executor between each poll so other devices remain live. */
     async fn wait_ready(&self, io: &mut DeviceIo) -> Result<()> {
         let mut count = 0;
+        let mut backoff_ms: u64 = 10;
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 
         while count < ROCCAT_MAX_RETRY_READY {
             let mut buf = [0u8; 3];
@@ -336,7 +338,8 @@ impl RoccatDriver {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(100);
             count += 1;
         }
 
@@ -573,8 +576,9 @@ impl DeviceDriver for RoccatDriver {
                     if let Some(profile_info) = info.profiles.iter_mut().find(|p| p.index == profile_idx as u32) {
                         for button_info in &mut profile_info.buttons {
                             let btn_idx = button_info.index as usize;
-                            if btn_idx < 24 {
-                                let raw_action = profile_report.buttons[btn_idx * 3];
+                            if btn_idx < ROCCAT_BUTTON_INDEX_MAX {
+                                debug_assert!(btn_idx * ROCCAT_BUTTON_STRIDE < profile_report.buttons.len());
+                                let raw_action = profile_report.buttons[btn_idx * ROCCAT_BUTTON_STRIDE];
                                 let (action_type, mapping_val) = roccat_raw_to_action(raw_action);
                                 button_info.action_type = action_type;
                                 button_info.mapping_value = mapping_val;
@@ -657,9 +661,10 @@ impl DeviceDriver for RoccatDriver {
             if let Some(mut profile_report) = self.cached_profiles[p_idx] {
                 for button_info in &profile.buttons {
                     let btn_idx = button_info.index as usize;
-                    if btn_idx < 24 {
+                    if btn_idx < ROCCAT_BUTTON_INDEX_MAX {
+                        debug_assert!(btn_idx * ROCCAT_BUTTON_STRIDE < profile_report.buttons.len());
                         let raw_action = roccat_action_to_raw(button_info.action_type, button_info.mapping_value);
-                        profile_report.buttons[btn_idx * 3] = raw_action;
+                        profile_report.buttons[btn_idx * ROCCAT_BUTTON_STRIDE] = raw_action;
 
                         if button_info.action_type == crate::device::ActionType::Macro {
                             let mut macro_rep = RoccatMacro {

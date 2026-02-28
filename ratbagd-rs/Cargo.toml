@@ -6,6 +6,11 @@ edition = "2024"
 description = "A Rust rewrite of the ratbagd daemon for configuring gaming mice"
 license = "GPLv3"
 
+[features]
+## Enable developer-only DBus hooks (LoadTestDevice / ResetTestDevice).
+## Never enable in production builds.
+dev-hooks = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }

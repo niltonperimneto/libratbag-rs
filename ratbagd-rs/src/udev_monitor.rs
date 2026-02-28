@@ -1,5 +1,6 @@
+/* udev hotplug monitor: enumerates existing hidraw devices and dispatches add/remove (and dev-hook
+ * test inject/remove) actions to the main DBus loop from a blocking thread. */
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -9,13 +10,28 @@ use tracing::{debug, info, warn};
 pub enum DeviceAction {
     Add {
         sysname: String,
-        devnode: PathBuf,
+        devnode: std::path::PathBuf,
         name: String,
         bustype: u16,
         vid: u16,
         pid: u16,
     },
     Remove {
+        sysname: String,
+    },
+    /// Inject a synthetic test device directly into the DBus layer.
+    ///
+    /// Only constructed when the `dev-hooks` feature is enabled.
+    #[cfg(feature = "dev-hooks")]
+    InjectTest {
+        sysname: String,
+        device_info: crate::device::DeviceInfo,
+    },
+    /// Remove a previously-injected test device.
+    ///
+    /// Only constructed when the `dev-hooks` feature is enabled.
+    #[cfg(feature = "dev-hooks")]
+    RemoveTest {
         sysname: String,
     },
 }
@@ -182,5 +198,9 @@ fn action_sysname(action: &DeviceAction) -> &str {
     match action {
         DeviceAction::Add { sysname, .. } => sysname,
         DeviceAction::Remove { sysname } => sysname,
+        #[cfg(feature = "dev-hooks")]
+        DeviceAction::InjectTest { sysname, .. } => sysname,
+        #[cfg(feature = "dev-hooks")]
+        DeviceAction::RemoveTest { sysname } => sysname,
     }
 }

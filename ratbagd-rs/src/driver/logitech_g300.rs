@@ -7,10 +7,8 @@ use tracing::debug;
 const LOGITECH_G300_PROFILE_MAX: u32 = 2;
 const LOGITECH_G300_BUTTON_MAX: u32 = 8;
 const LOGITECH_G300_NUM_DPI: u32 = 4;
-const LOGITECH_G300_NUM_LED: u32 = 1;
 
 const LOGITECH_G300_REPORT_ID_GET_ACTIVE: u8 = 0xF0;
-const LOGITECH_G300_REPORT_ID_SET_ACTIVE: u8 = 0xF0;
 const LOGITECH_G300_REPORT_ID_PROFILE_0: u8 = 0xF3;
 const LOGITECH_G300_REPORT_ID_PROFILE_1: u8 = 0xF4;
 const LOGITECH_G300_REPORT_ID_PROFILE_2: u8 = 0xF5;
@@ -18,13 +16,11 @@ const LOGITECH_G300_REPORT_ID_PROFILE_2: u8 = 0xF5;
 const LOGITECH_G300_REPORT_SIZE_ACTIVE: usize = 4;
 const LOGITECH_G300_REPORT_SIZE_PROFILE: usize = 35;
 
-#[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct LogitechG300Resolution {
     pub bitfield: u8, /* dpi (7-bit), is_default(1-bit) */
 }
 
-#[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct LogitechG300Button {
     pub code: u8,
@@ -32,7 +28,6 @@ pub struct LogitechG300Button {
     pub key: u8,
 }
 
-#[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct LogitechG300ProfileReport {
     pub id: u8,
@@ -216,6 +211,12 @@ impl DeviceDriver for LogitechG300Driver {
             };
 
             for btn in &profile.buttons {
+                let btn_idx = btn.index as usize;
+                if btn_idx >= report.buttons.len() {
+                    tracing::warn!("G300: button index {} out of range (max {}), skipping",
+                                   btn.index, report.buttons.len() - 1);
+                    continue;
+                }
                 let mut data = LogitechG300Button::default();
                 match btn.action_type {
                     crate::device::ActionType::Button => {
@@ -239,7 +240,7 @@ impl DeviceDriver for LogitechG300Driver {
                     }
                     _ => {}
                 }
-                report.buttons[btn.index as usize] = data;
+                report.buttons[btn_idx] = data;
             }
 
             if let Some(led) = profile.leds.first() {
