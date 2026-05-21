@@ -202,7 +202,7 @@ pub async fn run_server(
 ) -> Result<()> {
     let manager = manager::RatbagManager::default();
 
-    let conn = Builder::system()?
+    let conn = Builder::session()?
         .name("org.freedesktop.ratbag1")?
         .serve_at("/org/freedesktop/ratbag1", manager)?
         .build()

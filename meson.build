@@ -66,6 +66,12 @@ install_subdir(
     install_dir: join_paths(get_option('datadir'), 'libratbag'),
 )
 
+# Install generic catch-all udev rules
+install_data(
+    'data/60-ratbagd.rules',
+    install_dir: join_paths(get_option('prefix'), 'lib', 'udev', 'rules.d')
+)
+
 config_sbindir = configuration_data()
 config_sbindir.set('sbindir', join_paths(get_option('prefix'), get_option('sbindir')))
 
@@ -73,11 +79,11 @@ config_sbindir.set('sbindir', join_paths(get_option('prefix'), get_option('sbind
 if enable_systemd
     unitdir = get_option('systemd-unit-dir')
     if unitdir == ''
-        default_unitdir = dep_systemd.get_variable('systemdsystemunitdir')
-        intended_unitdir = join_paths(get_option('prefix'), get_option('libdir'), 'systemd')
+        default_unitdir = dep_systemd.get_variable('systemduserunitdir')
+        intended_unitdir = join_paths(get_option('prefix'), get_option('libdir'), 'systemd', 'user')
         if get_option('prefix') == '/usr' and intended_unitdir != default_unitdir
             message(
-                'systemd unitdir libdir mismatch detected, using @0@'.format(default_unitdir),
+                'systemd user unitdir libdir mismatch detected, using @0@'.format(default_unitdir),
             )
             unitdir = default_unitdir
         else
@@ -102,22 +108,5 @@ configure_file(
     input: 'dbus/org.freedesktop.ratbag1.service.in',
     output: 'org.freedesktop.ratbag1.service',
     configuration: config_sbindir,
-    install_dir: join_paths(dbusdir, 'system-services'),
-)
-
-dbusgroup = get_option('dbus-group')
-if dbusgroup == ''
-    access = 'context="default"'
-else
-    access = 'group="@0@"'.format(dbusgroup)
-endif
-
-config_dbusaccess = configuration_data()
-config_dbusaccess.set('access', access)
-
-configure_file(
-    input: 'dbus/org.freedesktop.ratbag1.conf.in',
-    output: 'org.freedesktop.ratbag1.conf',
-    configuration: config_dbusaccess,
-    install_dir: join_paths(dbusdir, 'system.d'),
+    install_dir: join_paths(dbusdir, 'services'),
 )

@@ -1,5 +1,4 @@
 [D-BUS Service]
 Name=org.freedesktop.ratbag1
 Exec=@sbindir@/ratbagd
-User=root
 SystemdService=ratbagd.service

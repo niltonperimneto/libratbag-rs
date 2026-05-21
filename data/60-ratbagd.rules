@@ -1,0 +1,10 @@
+# /usr/lib/udev/rules.d/60-ratbagd.rules
+#
+# Generic catch-all rule for libratbag
+# Matches any USB device exposing a raw HID interface (bInterfaceClass="03")
+# and delegates read/write permission to the physically seated user via systemd-logind.
+#
+# This eliminates the need to update udev rules manually or dynamically
+# every time a new gaming mouse is added to the database.
+
+ACTION=="add|change", KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{bInterfaceClass}=="03", TAG+="uaccess"

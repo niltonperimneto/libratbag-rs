@@ -20,7 +20,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nix = { version = "0.29", features = ["ioctl", "fs", "poll"] }
+nix = { version = "0.31.3", features = ["ioctl", "fs", "poll"] }
 udev = "0.9"
 tokio-stream = "0.1"
 configparser = "3"

@@ -1,11 +1,56 @@
 [Unit]
 Description=Daemon to introspect and modify configurable mice
+Requires=dbus.socket
+After=dbus.socket
+
 
 [Service]
 Type=dbus
 BusName=org.freedesktop.ratbag1
 ExecStart=@sbindir@/ratbagd
-Restart=on-abort
+Restart=on-failure
+RestartSec=5s
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# Kernel surface hardening
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Capabilities
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Device access
+PrivateDevices=false
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-usb_device rw
+
+# Syscall filter
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Resource limits
+MemoryHigh=64M
+MemoryMax=128M
+TasksMax=64
 
 [Install]
 Alias=dbus-org.freedesktop.ratbag1.service
+WantedBy=default.target
+

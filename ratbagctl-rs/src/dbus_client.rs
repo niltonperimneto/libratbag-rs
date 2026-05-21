@@ -23,11 +23,11 @@ pub struct RatbagClient {
 }
 
 impl RatbagClient {
-    /// Connect to the system bus.
+    /// Connect to the session bus.
     pub async fn connect() -> Result<Self> {
-        let conn = Connection::system()
+        let conn = Connection::session()
             .await
-            .context("Cannot connect to the system DBus")?;
+            .context("Cannot connect to the session DBus")?;
         Ok(Self { conn })
     }
 
