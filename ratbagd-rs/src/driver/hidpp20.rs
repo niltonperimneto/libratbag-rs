@@ -6,22 +6,20 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, info, trace, warn};
 
 use crate::device::{Color, DeviceInfo, Dpi, LedMode, ProfileInfo, RgbColor};
 use crate::driver::DeviceIo;
 
 use super::hidpp::{
-    self, HidppReport, DEVICE_IDX_CORDED, DEVICE_IDX_RECEIVER,
+    self, BUTTON_SUBTYPE_CONSUMER, BUTTON_SUBTYPE_KEYBOARD, BUTTON_SUBTYPE_MOUSE,
     BUTTON_TYPE_DISABLED, BUTTON_TYPE_HID, BUTTON_TYPE_MACRO, BUTTON_TYPE_SPECIAL,
-    BUTTON_SUBTYPE_CONSUMER, BUTTON_SUBTYPE_KEYBOARD, BUTTON_SUBTYPE_MOUSE,
-    LED_HW_MODE_BREATHING, LED_HW_MODE_COLOR_WAVE,
-    LED_HW_MODE_CYCLE, LED_HW_MODE_FIXED, LED_HW_MODE_OFF, LED_HW_MODE_STARLIGHT,
-    PAGE_ADJUSTABLE_DPI, PAGE_ADJUSTABLE_REPORT_RATE,
-    PAGE_COLOR_LED_EFFECTS, PAGE_ONBOARD_PROFILES, PAGE_RGB_EFFECTS,
-    PAGE_SPECIAL_KEYS_BUTTONS, ROOT_FEATURE_INDEX, ROOT_FN_GET_FEATURE,
-    ROOT_FN_GET_PROTOCOL_VERSION,
+    DEVICE_IDX_CORDED, DEVICE_IDX_RECEIVER, HidppReport, LED_HW_MODE_BREATHING,
+    LED_HW_MODE_COLOR_WAVE, LED_HW_MODE_CYCLE, LED_HW_MODE_FIXED, LED_HW_MODE_OFF,
+    LED_HW_MODE_STARLIGHT, PAGE_ADJUSTABLE_DPI, PAGE_ADJUSTABLE_REPORT_RATE,
+    PAGE_COLOR_LED_EFFECTS, PAGE_ONBOARD_PROFILES, PAGE_RGB_EFFECTS, PAGE_SPECIAL_KEYS_BUTTONS,
+    ROOT_FEATURE_INDEX, ROOT_FN_GET_FEATURE, ROOT_FN_GET_PROTOCOL_VERSION,
 };
 
 /* Software ID used in all our requests (arbitrary, identifies us) */
@@ -108,7 +106,6 @@ impl FeatureMap {
     }
 }
 
-
 /* HID++ 2.0 Button Binding representation (4 bytes) */
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Hidpp20ButtonBinding {
@@ -123,9 +120,13 @@ impl Hidpp20ButtonBinding {
         let subtype = buf[1];
         let mut control_id_or_macro_id = [0u8; 2];
         control_id_or_macro_id.copy_from_slice(&buf[2..4]);
-        Self { button_type, subtype, control_id_or_macro_id }
+        Self {
+            button_type,
+            subtype,
+            control_id_or_macro_id,
+        }
     }
-    
+
     pub fn into_bytes(self) -> [u8; 4] {
         let mut buf = [0u8; 4];
         buf[0] = self.button_type;
@@ -222,7 +223,7 @@ fn hidpp20_raw_to_special(raw: u8) -> u32 {
         0x09 => sa::PROFILE_DOWN,
         0x0a => sa::PROFILE_CYCLE_UP,
         0x0b => sa::SECOND_MODE,
-        _    => sa::UNKNOWN,
+        _ => sa::UNKNOWN,
     }
 }
 
@@ -231,18 +232,18 @@ fn hidpp20_raw_to_special(raw: u8) -> u32 {
 fn hidpp20_special_to_raw(special: u32) -> u8 {
     use crate::device::special_action as sa;
     match special {
-        sa::WHEEL_LEFT            => 0x01,
-        sa::WHEEL_RIGHT           => 0x02,
-        sa::RESOLUTION_UP         => 0x03,
-        sa::RESOLUTION_DOWN       => 0x04,
-        sa::RESOLUTION_CYCLE_UP   => 0x05,
-        sa::RESOLUTION_DEFAULT    => 0x06,
-        sa::RESOLUTION_ALTERNATE  => 0x07,
-        sa::PROFILE_UP            => 0x08,
-        sa::PROFILE_DOWN          => 0x09,
-        sa::PROFILE_CYCLE_UP      => 0x0a,
-        sa::SECOND_MODE           => 0x0b,
-        _                         => 0x00,
+        sa::WHEEL_LEFT => 0x01,
+        sa::WHEEL_RIGHT => 0x02,
+        sa::RESOLUTION_UP => 0x03,
+        sa::RESOLUTION_DOWN => 0x04,
+        sa::RESOLUTION_CYCLE_UP => 0x05,
+        sa::RESOLUTION_DEFAULT => 0x06,
+        sa::RESOLUTION_ALTERNATE => 0x07,
+        sa::PROFILE_UP => 0x08,
+        sa::PROFILE_DOWN => 0x09,
+        sa::PROFILE_CYCLE_UP => 0x0a,
+        sa::SECOND_MODE => 0x0b,
+        _ => 0x00,
     }
 }
 
@@ -302,7 +303,7 @@ pub struct Hidpp20OnboardProfilesInfo {
     pub profile_count: u8,
     pub profile_count_oob: u8,
     pub button_count: u8,
-    pub sector_size: [u8; 2],  /* Big Endian u16 */
+    pub sector_size: [u8; 2], /* Big Endian u16 */
 }
 
 impl Hidpp20OnboardProfilesInfo {
@@ -324,13 +325,17 @@ impl Hidpp20OnboardProfilesInfo {
         let button_count = buf[5];
         let mut sector_size = [0u8; 2];
         sector_size.copy_from_slice(&buf[7..9]);
-        Self { profile_count, profile_count_oob, button_count, sector_size }
+        Self {
+            profile_count,
+            profile_count_oob,
+            button_count,
+            sector_size,
+        }
     }
     pub fn sector_size(&self) -> u16 {
         u16::from_be_bytes(self.sector_size)
     }
 }
-
 
 pub struct Hidpp20Driver {
     device_index: u8,
@@ -363,11 +368,7 @@ impl Hidpp20Driver {
     /* even busy wireless links, while keeping the total probe phase short     */
     /* enough that the combined probe+load_profiles stays within the actor's   */
     /* timeout budget.                                                         */
-    async fn try_probe_index(
-        &self,
-        io: &mut DeviceIo,
-        idx: u8,
-    ) -> Option<(u8, u8)> {
+    async fn try_probe_index(&self, io: &mut DeviceIo, idx: u8) -> Option<(u8, u8)> {
         let request = hidpp::build_hidpp20_request(
             idx,
             ROOT_FEATURE_INDEX,
@@ -396,11 +397,7 @@ impl Hidpp20Driver {
 
     /* Query the Root feature (0x0000, fn 0) to find the runtime index of */
     /* a given feature page. Returns `None` if the device does not support it. */
-    async fn get_feature_index(
-        &self,
-        io: &mut DeviceIo,
-        feature_page: u16,
-    ) -> Result<Option<u8>> {
+    async fn get_feature_index(&self, io: &mut DeviceIo, feature_page: u16) -> Result<Option<u8>> {
         let [hi, lo] = feature_page.to_be_bytes();
 
         let request = hidpp::build_hidpp20_request(
@@ -416,7 +413,9 @@ impl Hidpp20Driver {
             let report = HidppReport::parse(buf)?;
 
             /* An error from the Root feature means the page is not supported. */
-            if report.hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX).is_some()
+            if report
+                .hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX)
+                .is_some()
                 || report.is_error()
             {
                 return Some(None);
@@ -451,13 +450,8 @@ impl Hidpp20Driver {
         function: u8,
         params: &[u8],
     ) -> Result<[u8; 16]> {
-        let request = hidpp::build_hidpp20_request(
-            self.device_index,
-            feature_index,
-            function,
-            SW_ID,
-            params,
-        );
+        let request =
+            hidpp::build_hidpp20_request(self.device_index, feature_index, function, SW_ID, params);
 
         /* Response is either Ok(params) or Err(error_code). */
         enum Resp {
@@ -471,9 +465,7 @@ impl Hidpp20Driver {
                 let report = HidppReport::parse(buf)?;
 
                 /* 1. Check for HID++ error (Long 0xFF or Short 0x8F). */
-                if let Some(code) =
-                    report.hidpp20_error_code(dev_idx, feature_index)
-                {
+                if let Some(code) = report.hidpp20_error_code(dev_idx, feature_index) {
                     return Some(Resp::HidppErr(code));
                 }
 
@@ -509,9 +501,7 @@ impl Hidpp20Driver {
             })
             .await
             .with_context(|| {
-                format!(
-                    "Feature request (idx=0x{feature_index:02X}, fn={function}) failed"
-                )
+                format!("Feature request (idx=0x{feature_index:02X}, fn={function}) failed")
             })?;
 
         match resp {
@@ -538,7 +528,11 @@ impl Hidpp20Driver {
         params: &[u8],
     ) -> Result<()> {
         let request = hidpp::build_hidpp20_short_request_with_params(
-            self.device_index, feature_index, function, SW_ID, params,
+            self.device_index,
+            feature_index,
+            function,
+            SW_ID,
+            params,
         );
 
         enum Resp {
@@ -695,7 +689,7 @@ impl Hidpp20Driver {
             }
             current_offset += chunk_size;
         }
-        
+
         Ok(result)
     }
 
@@ -773,11 +767,7 @@ impl Hidpp20Driver {
     }
 
     /* Read DPI sensor information using feature 0x2201. */
-    async fn read_dpi_info(
-        &self,
-        io: &mut DeviceIo,
-        profile: &mut ProfileInfo,
-    ) -> Result<()> {
+    async fn read_dpi_info(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
         let Some(idx) = self.features.adjustable_dpi else {
             return Ok(());
         };
@@ -847,11 +837,7 @@ impl Hidpp20Driver {
     }
 
     /* Read LED zone effect from the device using feature 0x8070. */
-    async fn read_led_info(
-        &self,
-        io: &mut DeviceIo,
-        profile: &mut ProfileInfo,
-    ) -> Result<()> {
+    async fn read_led_info(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
         let Some(idx) = self.features.color_led_effects else {
             return Ok(());
         };
@@ -863,7 +849,10 @@ impl Hidpp20Driver {
                 .await?;
 
             if response[0] != zone_index {
-                warn!("LED read: zone mismatch (expected {zone_index}, got {})", response[0]);
+                warn!(
+                    "LED read: zone mismatch (expected {zone_index}, got {})",
+                    response[0]
+                );
                 continue;
             }
 
@@ -875,11 +864,7 @@ impl Hidpp20Driver {
 
     /* Write LED zone effect to the device using feature 0x8070. */
     /* TriColor mode is routed through feature 0x8071 (RGB Effects) instead. */
-    async fn write_led_info(
-        &self,
-        io: &mut DeviceIo,
-        profile: &ProfileInfo,
-    ) -> Result<()> {
+    async fn write_led_info(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
         for led in &profile.leds {
             let zone_index = led.index as u8;
 
@@ -913,18 +898,17 @@ impl Hidpp20Driver {
                     .context("Failed to write LED zone effect")?;
             }
 
-            debug!("HID++ 2.0: committed LED zone {zone_index} mode={:?}", led.mode);
+            debug!(
+                "HID++ 2.0: committed LED zone {zone_index} mode={:?}",
+                led.mode
+            );
         }
 
         Ok(())
     }
 
     /* Write DPI sensor information using feature 0x2201. */
-    async fn write_dpi_info(
-        &self,
-        io: &mut DeviceIo,
-        profile: &ProfileInfo,
-    ) -> Result<()> {
+    async fn write_dpi_info(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
         let Some(idx) = self.features.adjustable_dpi else {
             return Ok(());
         };
@@ -935,21 +919,21 @@ impl Hidpp20Driver {
             let dpi_u16 = dpi_val.min(u32::from(u16::MAX)) as u16;
             let [hi, lo] = dpi_u16.to_be_bytes();
             /* setSensorDPI is fn=3; only sensor_index + dpi_hi + dpi_lo are needed */
-            let response = self.feature_request(io, idx, DPI_FN_SET_SENSOR_DPI, &[0, hi, lo])
+            let response = self
+                .feature_request(io, idx, DPI_FN_SET_SENSOR_DPI, &[0, hi, lo])
                 .await
                 .context("Failed to write DPI")?;
             let actual_dpi = u16::from_be_bytes([response[1], response[2]]);
-            debug!("HID++ 2.0: committed DPI = {} (device ack: {})", dpi_val, actual_dpi);
+            debug!(
+                "HID++ 2.0: committed DPI = {} (device ack: {})",
+                dpi_val, actual_dpi
+            );
         }
         Ok(())
     }
 
     /* Write report rate using feature 0x8060. */
-    async fn write_report_rate(
-        &self,
-        io: &mut DeviceIo,
-        profile: &ProfileInfo,
-    ) -> Result<()> {
+    async fn write_report_rate(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
         const RATE_FN_SET_REPORT_RATE: u8 = 0x02;
 
         let Some(idx) = self.features.report_rate else {
@@ -960,7 +944,10 @@ impl Hidpp20Driver {
             /* Some firmware returns INVALID_ARGUMENT when asked to set the
              * rate that is already active. Skip the write when unchanged. */
             if profile.report_rate == self.cached_report_rate_hz {
-                debug!("HID++ 2.0: report rate unchanged at {} Hz, skipping write", profile.report_rate);
+                debug!(
+                    "HID++ 2.0: report rate unchanged at {} Hz, skipping write",
+                    profile.report_rate
+                );
                 return Ok(());
             }
             /* Clamp the ms-interval to u8 range; realistic rates (125–8000 Hz)
@@ -969,7 +956,10 @@ impl Hidpp20Driver {
             self.feature_request(io, idx, RATE_FN_SET_REPORT_RATE, &[rate_ms])
                 .await
                 .context("Failed to write report rate")?;
-            debug!("HID++ 2.0: committed report rate = {} Hz", profile.report_rate);
+            debug!(
+                "HID++ 2.0: committed report rate = {} Hz",
+                profile.report_rate
+            );
         }
         Ok(())
     }
@@ -982,10 +972,7 @@ impl Hidpp20Driver {
     /// Returns the expanded list of supported DPI values, or `None` if the
     /// feature is absent.  This is device-wide information used for the UI
     /// (Piper) — it does NOT read the current DPI setting.
-    async fn query_dpi_sensor_range(
-        &self,
-        io: &mut DeviceIo,
-    ) -> Option<Vec<u32>> {
+    async fn query_dpi_sensor_range(&self, io: &mut DeviceIo) -> Option<Vec<u32>> {
         let idx = self.features.adjustable_dpi?;
 
         let list_data = self
@@ -1001,15 +988,16 @@ impl Hidpp20Driver {
             dpi_list.last().unwrap_or(&0),
         );
 
-        if dpi_list.is_empty() { None } else { Some(dpi_list) }
+        if dpi_list.is_empty() {
+            None
+        } else {
+            Some(dpi_list)
+        }
     }
 
     /// Query the supported report rate list via feature 0x8060.
     /// Returns the list of supported rates in Hz, or `None` if absent.
-    async fn query_report_rate_list(
-        &self,
-        io: &mut DeviceIo,
-    ) -> Option<Vec<u32>> {
+    async fn query_report_rate_list(&self, io: &mut DeviceIo) -> Option<Vec<u32>> {
         let idx = self.features.report_rate?;
 
         let list_data = self
@@ -1072,14 +1060,12 @@ impl Hidpp20Driver {
             LED_HW_MODE_CYCLE => {
                 led.mode = LedMode::Cycle;
                 /* bytes 1-5 unused; period at bytes 6-7 (BE), intensity at byte 8 */
-                led.effect_duration =
-                    u32::from(u16::from_be_bytes([led_bytes[6], led_bytes[7]]));
+                led.effect_duration = u32::from(u16::from_be_bytes([led_bytes[6], led_bytes[7]]));
                 led.brightness = u32::from(led_bytes[8]) * 255 / 100;
             }
             LED_HW_MODE_COLOR_WAVE => {
                 led.mode = LedMode::ColorWave;
-                led.effect_duration =
-                    u32::from(u16::from_be_bytes([led_bytes[6], led_bytes[7]]));
+                led.effect_duration = u32::from(u16::from_be_bytes([led_bytes[6], led_bytes[7]]));
                 led.brightness = u32::from(led_bytes[8]) * 255 / 100;
             }
             LED_HW_MODE_STARLIGHT => {
@@ -1102,8 +1088,7 @@ impl Hidpp20Driver {
                     g: led_bytes[2],
                     b: led_bytes[3],
                 });
-                led.effect_duration =
-                    u32::from(u16::from_be_bytes([led_bytes[4], led_bytes[5]]));
+                led.effect_duration = u32::from(u16::from_be_bytes([led_bytes[4], led_bytes[5]]));
                 /* byte 6 = waveform */
                 led.brightness = u32::from(led_bytes[7]) * 255 / 100;
             }
@@ -1112,7 +1097,10 @@ impl Hidpp20Driver {
             }
         }
 
-        debug!("EEPROM LED {led_index}: mode={:?} color={:?}", led.mode, led.color);
+        debug!(
+            "EEPROM LED {led_index}: mode={:?} color={:?}",
+            led.mode, led.color
+        );
         led
     }
 
@@ -1197,9 +1185,7 @@ impl super::DeviceDriver for Hidpp20Driver {
         for &idx in PROBE_INDICES {
             if let Some((major, minor)) = self.try_probe_index(io, idx).await {
                 self.device_index = idx;
-                info!(
-                    "HID++ 2.0 device detected at index 0x{idx:02X} (protocol {major}.{minor})"
-                );
+                info!("HID++ 2.0 device detected at index 0x{idx:02X} (protocol {major}.{minor})");
                 self.discover_features(io).await?;
                 return Ok(());
             }
@@ -1212,16 +1198,8 @@ impl super::DeviceDriver for Hidpp20Driver {
         );
     }
 
-    async fn load_profiles(
-        &mut self,
-        io: &mut DeviceIo,
-        info: &mut DeviceInfo,
-    ) -> Result<()> {
-        let has_g305_quirk = info
-            .driver_config
-            .quirks
-            .iter()
-            .any(|q| q == "G305");
+    async fn load_profiles(&mut self, io: &mut DeviceIo, info: &mut DeviceInfo) -> Result<()> {
+        let has_g305_quirk = info.driver_config.quirks.iter().any(|q| q == "G305");
 
         /* If the device has PAGE_ONBOARD_PROFILES (0x8100), we initialize based on hardware capacity */
         if let Some(idx) = self.features.onboard_profiles {
@@ -1232,10 +1210,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                 .await
                 .context("Failed to get Onboard Profiles Description")?;
 
-            info!(
-                "HID++ 2.0: raw descriptor bytes: {:02X?}",
-                &desc_data[..16]
-            );
+            info!("HID++ 2.0: raw descriptor bytes: {:02X?}", &desc_data[..16]);
 
             let desc = Hidpp20OnboardProfilesInfo::from_bytes(&desc_data);
             self.cached_onboard_info = Some(desc);
@@ -1299,10 +1274,12 @@ impl super::DeviceDriver for Hidpp20Driver {
             }
 
             /* Resize the Ratbag device abstraction to exactly match the hardware capabilities */
-            info.profiles.resize_with(profile_count, ProfileInfo::default);
+            info.profiles
+                .resize_with(profile_count, ProfileInfo::default);
             for (i, p) in info.profiles.iter_mut().enumerate() {
                 p.index = i as u32;
-                p.buttons.resize_with(button_count, crate::device::ButtonInfo::default);
+                p.buttons
+                    .resize_with(button_count, crate::device::ButtonInfo::default);
                 for (b_idx, b) in p.buttons.iter_mut().enumerate() {
                     b.index = b_idx as u32;
                 }
@@ -1370,10 +1347,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                             break;
                         }
 
-                        let addr = u16::from_be_bytes([
-                            root_data[offset],
-                            root_data[offset + 1],
-                        ]);
+                        let addr = u16::from_be_bytes([root_data[offset], root_data[offset + 1]]);
                         if addr == 0xFFFF {
                             break;
                         }
@@ -1464,8 +1438,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                 /* --- Report rate (byte 0): stored as ms-interval, convert to Hz --- */
                 if !profile_data.is_empty() && profile_data[0] > 0 {
                     p.report_rate = 1000 / (profile_data[0] as u32);
-                    debug!("HID++ 2.0: profile {i} EEPROM report rate = {} Hz (interval {}ms)",
-                           p.report_rate, profile_data[0]);
+                    debug!(
+                        "HID++ 2.0: profile {i} EEPROM report rate = {} Hz (interval {}ms)",
+                        p.report_rate, profile_data[0]
+                    );
                 }
 
                 /* --- DPI list (bytes 3-12): 5 entries × 2 bytes LE --- */
@@ -1477,7 +1453,8 @@ impl super::DeviceDriver for Hidpp20Driver {
                 for d_idx in 0..5usize {
                     let d_off = 3 + d_idx * 2;
                     if d_off + 2 <= profile_data.len() {
-                        let raw = u16::from_le_bytes([profile_data[d_off], profile_data[d_off + 1]]);
+                        let raw =
+                            u16::from_le_bytes([profile_data[d_off], profile_data[d_off + 1]]);
                         if raw == 0 || raw == 0xFFFF {
                             eeprom_dpis.push((0, true));
                         } else {
@@ -1494,8 +1471,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                 };
 
                 if !eeprom_dpis.is_empty() {
-                    debug!("HID++ 2.0: profile {i} EEPROM DPIs: {:?} (default idx {})",
-                           eeprom_dpis, default_dpi_idx);
+                    debug!(
+                        "HID++ 2.0: profile {i} EEPROM DPIs: {:?} (default idx {})",
+                        eeprom_dpis, default_dpi_idx
+                    );
 
                     /* Rebuild the resolutions list to match the EEPROM entries. */
                     p.resolutions.clear();
@@ -1531,7 +1510,11 @@ impl super::DeviceDriver for Hidpp20Driver {
                             /* EEPROM mouse buttons are stored as a big-endian bit mask.
                              * ffs(mask) gives the 1-based button ordinal. */
                             (BUTTON_TYPE_HID, BUTTON_SUBTYPE_MOUSE) => {
-                                if raw_id > 0 { u32::from(raw_id.trailing_zeros()) + 1 } else { 0 }
+                                if raw_id > 0 {
+                                    u32::from(raw_id.trailing_zeros()) + 1
+                                } else {
+                                    0
+                                }
                             }
                             /* Translate the raw HID++ special opcode to the
                              * canonical special_action constant for DBus. */
@@ -1571,9 +1554,7 @@ impl super::DeviceDriver for Hidpp20Driver {
             }
         } else {
             /* No onboard profiles feature — create a single host-managed profile. */
-            info!(
-                "HID++ 2.0: no onboard profiles feature; using single host-managed profile"
-            );
+            info!("HID++ 2.0: no onboard profiles feature; using single host-managed profile");
             if info.profiles.is_empty() {
                 info.profiles.push(ProfileInfo::default());
             }
@@ -1593,7 +1574,9 @@ impl super::DeviceDriver for Hidpp20Driver {
                     /* resp[1] is the 1-based profile sector, convert to 0-based */
                     let sector = resp[1];
                     let zero_based = if sector > 0 { u32::from(sector) - 1 } else { 0 };
-                    info!("HID++ 2.0: hardware reports active profile sector={sector}, index={zero_based}");
+                    info!(
+                        "HID++ 2.0: hardware reports active profile sector={sector}, index={zero_based}"
+                    );
                     zero_based
                 }
                 Err(e) => {
@@ -1678,7 +1661,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                     warn!("Failed to read DPI for profile {}: {e}", profile.index);
                 }
                 if let Err(e) = self.read_report_rate(io, profile).await {
-                    warn!("Failed to read report rate for profile {}: {e}", profile.index);
+                    warn!(
+                        "Failed to read report rate for profile {}: {e}",
+                        profile.index
+                    );
                 }
                 if let Err(e) = self.read_led_info(io, profile).await {
                     warn!("Failed to read LEDs for profile {}: {e}", profile.index);
@@ -1706,7 +1692,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                     warn!("Failed to commit DPI for profile {}: {e:#}", profile.index);
                 }
                 if let Err(e) = self.write_report_rate(io, profile).await {
-                    warn!("Failed to commit report rate for profile {}: {e:#}", profile.index);
+                    warn!(
+                        "Failed to commit report rate for profile {}: {e:#}",
+                        profile.index
+                    );
                 }
                 if let Err(e) = self.write_led_info(io, profile).await {
                     warn!("Failed to commit LEDs for profile {}: {e:#}", profile.index);
@@ -1718,6 +1707,35 @@ impl super::DeviceDriver for Hidpp20Driver {
         if let Some(idx) = self.features.onboard_profiles {
             if let Some(desc) = self.cached_onboard_info {
                 let sector_size = desc.sector_size();
+
+                /* A sector_size of 0 means the device reported no writable EEPROM
+                 * (seen on the G305 when flash has never been initialised).
+                 * Attempting EEPROM writes with size=0 would panic on the first
+                 * profile_data[0] access.  Instead, clear the spurious repair
+                 * flag (there is nothing to repair) and fall back to the same
+                 * live feature writes used by host-managed devices. */
+                if sector_size == 0 {
+                    warn!(
+                        "HID++ 2.0: onboard profiles descriptor reports sector_size=0 \
+                         (profiles={}, buttons={}) — EEPROM unavailable; \
+                         falling back to live feature writes",
+                        desc.profile_count, desc.button_count
+                    );
+                    self.needs_eeprom_repair = false;
+                    if let Some(profile) = info.profiles.iter().find(|p| p.is_active) {
+                        if let Err(e) = self.write_dpi_info(io, profile).await {
+                            warn!("Failed to commit DPI via live write: {e:#}");
+                        }
+                        if let Err(e) = self.write_report_rate(io, profile).await {
+                            warn!("Failed to commit report rate via live write: {e:#}");
+                        }
+                        if let Err(e) = self.write_led_info(io, profile).await {
+                            warn!("Failed to commit LEDs via live write: {e:#}");
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let force_repair = self.needs_eeprom_repair;
 
                 /* Switch to host mode before writing EEPROM. Firmware rejects
@@ -1728,7 +1746,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                 {
                     warn!("Failed to switch to host mode: {e:#}");
                 }
-                
+
                 /* Write each dirty profile to its sector.  Like the legacy C
                  * driver (hidpp20_onboard_profiles_write_profile), the sector
                  * address is simply `profile_index + 1` (0-based index → sector
@@ -1781,8 +1799,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                     /* 3. DPI list (bytes 3-12, 5 × LE u16) */
                     for (i, res) in profile.resolutions.iter().enumerate().take(5) {
                         if let Dpi::Unified(val) = res.dpi {
-                            let dpi_bytes =
-                                (val.min(u32::from(u16::MAX)) as u16).to_le_bytes();
+                            let dpi_bytes = (val.min(u32::from(u16::MAX)) as u16).to_le_bytes();
                             profile_data[3 + i * 2] = dpi_bytes[0];
                             profile_data[3 + i * 2 + 1] = dpi_bytes[1];
                         }
@@ -1837,7 +1854,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                             any_written = true;
                         }
                         Err(e) => {
-                            warn!("Failed to write EEPROM sector 0x{addr:04X} for profile {}: {e}", profile.index);
+                            warn!(
+                                "Failed to write EEPROM sector 0x{addr:04X} for profile {}: {e}",
+                                profile.index
+                            );
                             last_err = Some(e);
                         }
                     }
@@ -1852,8 +1872,10 @@ impl super::DeviceDriver for Hidpp20Driver {
                     let mut dir = vec![0xFFu8; sector_size as usize];
                     let mut pos = 0usize;
                     for profile in &info.profiles {
-                        if pos + 4 > dir.len().saturating_sub(2) { break; }
-                        dir[pos]     = 0x00;
+                        if pos + 4 > dir.len().saturating_sub(2) {
+                            break;
+                        }
+                        dir[pos] = 0x00;
                         dir[pos + 1] = (profile.index + 1) as u8;
                         dir[pos + 2] = u8::from(profile.is_enabled);
                         dir[pos + 3] = 0x00;
@@ -1861,7 +1883,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                     }
                     /* End-of-directory marker */
                     if pos + 4 <= dir.len().saturating_sub(2) {
-                        dir[pos]     = 0xFF;
+                        dir[pos] = 0xFF;
                         dir[pos + 1] = 0xFF;
                         dir[pos + 2] = 0x00;
                         dir[pos + 3] = 0x00;
@@ -1870,7 +1892,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                     let dir_crc_off = dir.len() - 2;
                     let dir_crc = hidpp::compute_ccitt_crc(&dir[..dir_crc_off]);
                     let dir_crc_bytes = dir_crc.to_be_bytes();
-                    dir[dir_crc_off]     = dir_crc_bytes[0];
+                    dir[dir_crc_off] = dir_crc_bytes[0];
                     dir[dir_crc_off + 1] = dir_crc_bytes[1];
 
                     if let Err(e) = self.write_sector(io, idx, 0x0000, 0, &dir).await {
@@ -1905,7 +1927,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                  * firmware last selected and Piper's profile switching has no
                  * effect on the actual hardware output. */
                 if let Some(active) = info.profiles.iter().find(|p| p.is_active) {
-                    let sector = (active.index + 1) as u8;  /* 0-based → 1-based */
+                    let sector = (active.index + 1) as u8; /* 0-based → 1-based */
                     /* C driver uses REPORT_ID_SHORT for this command.
                      * Some firmware silently drops long reports here. */
                     if let Err(e) = self
@@ -1943,9 +1965,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                             )
                             .await
                         {
-                            warn!(
-                                "HID++ 2.0: failed to set DPI index to {dpi_idx}: {e}"
-                            );
+                            warn!("HID++ 2.0: failed to set DPI index to {dpi_idx}: {e}");
                         } else {
                             debug!("HID++ 2.0: set current DPI index = {dpi_idx}");
                         }
@@ -1966,21 +1986,25 @@ impl super::DeviceDriver for Hidpp20Driver {
      *
      * Returns `true` if the event caused a state change that the actor
      * should propagate via DBus signals. */
-    async fn handle_event(
-        &mut self,
-        report: &[u8],
-        info: &mut DeviceInfo,
-    ) -> Result<bool> {
+    async fn handle_event(&mut self, report: &[u8], info: &mut DeviceInfo) -> Result<bool> {
         let Some(parsed) = HidppReport::parse(report) else {
             return Ok(false);
         };
 
         /* Extract common fields; we only care about reports addressed to our device. */
         let (dev_idx, sub_id, params) = match &parsed {
-            HidppReport::Long { device_index, sub_id, params, .. } =>
-                (*device_index, *sub_id, &params[..]),
-            HidppReport::Short { device_index, sub_id, params, .. } =>
-                (*device_index, *sub_id, &params[..]),
+            HidppReport::Long {
+                device_index,
+                sub_id,
+                params,
+                ..
+            } => (*device_index, *sub_id, &params[..]),
+            HidppReport::Short {
+                device_index,
+                sub_id,
+                params,
+                ..
+            } => (*device_index, *sub_id, &params[..]),
         };
 
         if dev_idx != self.device_index {
@@ -1988,11 +2012,7 @@ impl super::DeviceDriver for Hidpp20Driver {
         }
 
         /* Check if this is a notification from the Onboard Profiles feature. */
-        if let Some(_onboard_idx) = self
-            .features
-            .onboard_profiles
-            .filter(|&idx| sub_id == idx)
-        {
+        if let Some(_onboard_idx) = self.features.onboard_profiles.filter(|&idx| sub_id == idx) {
             /* The function nibble is in the address byte (byte [3]).
              * For a profile-change notification, we expect the
              * GET_CURRENT_PROFILE function (0x04) as the response
@@ -2002,7 +2022,11 @@ impl super::DeviceDriver for Hidpp20Driver {
             if function == PROFILES_FN_GET_CURRENT_PROFILE
                 || function == PROFILES_FN_SET_CURRENT_PROFILE
             {
-                let sector = if params.len() > 1 { params[1] } else { params[0] };
+                let sector = if params.len() > 1 {
+                    params[1]
+                } else {
+                    params[0]
+                };
                 if sector == 0 {
                     return Ok(false);
                 }

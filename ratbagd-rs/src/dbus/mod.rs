@@ -29,6 +29,21 @@ pub(crate) fn fallback_owned_value() -> OwnedValue {
     OwnedValue::from(0u32)
 }
 
+/* Walk an error chain looking for an `EACCES` (permission denied) cause.
+ *
+ * Under the unprivileged session-daemon model the device node is opened via
+ * the `uaccess` ACL that systemd-logind grants to the seated user. On hotplug
+ * the node appears slightly before logind applies that ACL, so the first
+ * open() can transiently fail with `Permission denied`. We treat that case as
+ * retryable (with a longer back-off) rather than a hard failure. */
+fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
 /* D-Bus interface tag stored alongside each object path so that teardown
  * removes only the correct interface type in O(n) rather than blindly
  * attempting all five types per path. */
@@ -327,98 +342,87 @@ pub async fn run_server(
                 );
 
                 // Wrap DeviceInfo in Arc<RwLock> so actor and DBus share state.
-                // `mut` because the retry path may replace this with fresh state.
+                // `mut` because each probe attempt installs fresh state.
                 let mut shared_info = Arc::new(RwLock::new(device_info));
 
-                /* Try to create and spawn the hardware driver actor.
-                 * If the probe fails (wrong hidraw interface, unsupported
-                 * firmware, etc.) do NOT register the device on D-Bus —
-                 * it would appear as an empty, non-functional entry.
+                /* Try to create and spawn the hardware driver actor, retrying
+                 * a few times with a back-off. If every attempt fails (wrong
+                 * hidraw interface, unsupported firmware, etc.) do NOT register
+                 * the device on D-Bus — it would appear as an empty,
+                 * non-functional entry.
                  *
-                 * A single retry after a short delay handles transient
-                 * failures during USB settle (device not ready yet) and
-                 * avoids permanently missing a device that just needed a
-                 * moment to initialize. */
-                let actor_handle = match driver::create_driver(&entry.driver) {
-                    Some(drv) => {
-                        match actor::spawn_device_actor(
-                            &devnode,
-                            drv,
-                            Arc::clone(&shared_info),
-                        )
-                        .await
-                        {
-                            Ok(handle) => {
-                                info!(
-                                    "Driver {} active for {}",
-                                    entry.driver, sysname
-                                );
-                                handle
-                            }
-                            Err(e) => {
-                                info!(
-                                    "Driver {} probe failed for {} (attempt 1/2): {e:#}, \
-                                     retrying after settle delay",
-                                    entry.driver, sysname
-                                );
+                 * Retries cover two distinct transient conditions:
+                 *   - USB settle: the device node exists but the hardware is
+                 *     not ready to answer probe requests yet.
+                 *   - uaccess ACL race: on hotplug the node appears slightly
+                 *     before systemd-logind grants the seated user access, so
+                 *     open() fails with EACCES for a brief window. See
+                 *     is_permission_denied(). */
+                const MAX_PROBE_ATTEMPTS: u32 = 5;
+                const BASE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-                                /* Brief delay for USB settle before retry. */
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                                match driver::create_driver(&entry.driver) {
-                                    Some(drv2) => {
-                                        /* Re-create shared_info for the retry since the
-                                         * first attempt may have partially mutated it. */
-                                        let retry_info = Arc::new(RwLock::new(
-                                            DeviceInfo::from_entry(
-                                                &sysname, &name, bustype, vid, pid, entry,
-                                            ),
-                                        ));
-                                        match actor::spawn_device_actor(
-                                            &devnode,
-                                            drv2,
-                                            Arc::clone(&retry_info),
-                                        )
-                                        .await
-                                        {
-                                            Ok(handle) => {
-                                                /* Swap in the fresh info for DBus
-                                                 * registration below. */
-                                                shared_info = retry_info;
-                                                info!(
-                                                    "Driver {} active for {} (retry succeeded)",
-                                                    entry.driver, sysname
-                                                );
-                                                handle
-                                            }
-                                            Err(e2) => {
-                                                warn!(
-                                                    "Driver {} probe failed for {} (attempt 2/2): \
-                                                     {e2:#}",
-                                                    entry.driver, sysname
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        warn!(
-                                            "No driver implementation for '{}' on retry",
-                                            entry.driver
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
+                let mut actor_handle = None;
+                for attempt in 1..=MAX_PROBE_ATTEMPTS {
+                    let Some(drv) = driver::create_driver(&entry.driver) else {
                         warn!(
                             "No driver implementation for '{}', skipping {}",
                             entry.driver, sysname
                         );
-                        continue;
+                        break;
+                    };
+
+                    /* Fresh state each attempt: a failed probe may have
+                     * partially mutated it. */
+                    let attempt_info = Arc::new(RwLock::new(DeviceInfo::from_entry(
+                        &sysname, &name, bustype, vid, pid, entry,
+                    )));
+
+                    match actor::spawn_device_actor(&devnode, drv, Arc::clone(&attempt_info))
+                        .await
+                    {
+                        Ok(handle) => {
+                            shared_info = attempt_info;
+                            if attempt > 1 {
+                                info!(
+                                    "Driver {} active for {} (retry {attempt} succeeded)",
+                                    entry.driver, sysname
+                                );
+                            } else {
+                                info!("Driver {} active for {}", entry.driver, sysname);
+                            }
+                            actor_handle = Some(handle);
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt == MAX_PROBE_ATTEMPTS {
+                                warn!(
+                                    "Driver {} probe failed for {} \
+                                     (attempt {attempt}/{MAX_PROBE_ATTEMPTS}): {e:#}",
+                                    entry.driver, sysname
+                                );
+                                break;
+                            }
+
+                            /* Back off longer for EACCES: the uaccess ACL may
+                             * still be on its way from logind. */
+                            let delay = if is_permission_denied(&e) {
+                                BASE_SETTLE_DELAY * attempt
+                            } else {
+                                BASE_SETTLE_DELAY
+                            };
+                            info!(
+                                "Driver {} probe failed for {} \
+                                 (attempt {attempt}/{MAX_PROBE_ATTEMPTS}): {e:#}, \
+                                 retrying in {delay:?}",
+                                entry.driver, sysname
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                     }
+                }
+
+                let Some(actor_handle) = actor_handle else {
+                    continue;
                 };
 
                 let object_paths = register_device_on_dbus(
