@@ -8,13 +8,62 @@ mainly gaming mice. The daemon provides a generic way to access the various
 features exposed by these mice and abstracts away hardware-specific and
 kernel-specific quirks.
 
-**As of version 1.0, the ratbagd daemon has been rewritten in Rust
-(`ratbagd-rs`).** The new daemon is a drop-in replacement for the legacy C
-implementation — it speaks the same `org.freedesktop.ratbag1` DBus API
-(version 2), uses the same device database and `.device` files, and deploys
-through the same systemd/DBus service-activation chain. The old C daemon
-has been removed and the CLI replaced with a new Rust `ratbagctl`
-tool built on the same DBus API.
+**As of version 2.0, the ratbagd daemon has been rewritten in Rust
+(`ratbagd-rs`) and migrated to an unprivileged session daemon.** The new daemon speaks the same `org.freedesktop.ratbag1`
+DBus API (version 2) and uses the same device database and `.device` files.
+The old C daemon has been removed and the CLI replaced with a new Rust
+`ratbagctl` tool built on the same DBus API.
+
+> ⚠️ **Breaking change: ratbagd now runs on the session bus, not the system
+> bus.** This intentionally breaks compatibility with current
+> [Piper](https://github.com/libratbag/piper/) releases, which connect to
+> ratbagd on the **system** bus. See
+> [Session Bus Migration](#session-bus-migration-breaking-change-for-piper)
+> below for what changed and why.
+
+Session Bus Migration (Breaking Change for Piper)
+-------------------------------------------------
+
+`ratbagd-rs` no longer runs as a `root` system daemon on the **system bus**.
+It now runs as an unprivileged **session daemon** on the user's **session
+bus** (`zbus::Connection::session()`), spawned and managed by
+`systemd --user`. Device access is granted to the physically seated user via
+`udev` + `uaccess` instead of by running as root.
+
+### What this breaks
+
+Existing [Piper](https://github.com/libratbag/piper/) releases connect to
+ratbagd over the **system bus** (`Gio.BusType.SYSTEM`). Because the daemon no
+longer claims `org.freedesktop.ratbag1` on the system bus, **stock Piper can
+no longer find or talk to ratbagd** and will report that the daemon is not
+running. Piper would need to be patched to connect to the session bus to work
+with this daemon. [Twister](#twister-desktop-gui), the GUI included in this
+repository, already connects on the session bus.
+
+The new `data/60-ratbagd.rules` udev rule (which tags raw HID interfaces with
+`uaccess`) does **not** itself affect Piper — it only governs `/dev/hidraw*`
+node permissions. The compatibility break comes from the bus migration, not
+the udev rule.
+
+### Why we broke compatibility
+
+The legacy architecture ran `ratbagd` as `root` solely to bypass file
+permissions on `/dev/hidraw*`. This violates the principle of least
+privilege: configuring DPI, RGB, or button bindings does not warrant
+administrative access. USB hardware is untrusted, and a malicious or
+compromised device can send malformed HID reports crafted to exploit parsing
+flaws — and any such exploit in a root daemon becomes a full system
+compromise (privilege escalation).
+
+Running as an unprivileged session daemon **contains the blast radius**: an
+exploit triggered by a malicious mouse is confined to the unprivileged user's
+session, leaving the host OS intact. It also models device settings correctly
+as per-user preferences and behaves sensibly on multi-user systems, where the
+kernel's seat management (`systemd-logind`) grants hardware access only to the
+physically seated user.
+
+See [SESSION_DAEMON_PLAN.md](SESSION_DAEMON_PLAN.md) for the full
+architectural rationale and roadmap.
 
 Supported Devices
 -----------------
@@ -28,8 +77,10 @@ for a complete list of supported devices.
 
 Users interact through a GUI like
 [Twister](twister/) (a modern Tauri + Svelte desktop app included in this
-repository) or [Piper](https://github.com/libratbag/piper/), or the
-`ratbagctl` command-line tool (see below).
+repository), or the `ratbagctl` command-line tool (see below).
+[Piper](https://github.com/libratbag/piper/) is **not currently compatible**
+because the daemon moved to the session bus — see
+[Session Bus Migration](#session-bus-migration-breaking-change-for-piper).
 
 What Changed in the Rust Rewrite
 ---------------------------------
@@ -53,9 +104,11 @@ The core `ratbagd` daemon has been rewritten from C to Rust. Key changes:
   `LoadTestDevice` / `ResetTestDevice` DBus methods on the Manager
   interface, allowing integration tests to inject synthetic devices without
   real hardware.
-- **Zero configuration drift** — the Rust binary is built as `ratbagd` and
-  installed to `sbindir`; the existing systemd unit, DBus activation file,
-  and DBus policy are reused unchanged.
+- **Session daemon, not a root system daemon** — the daemon now runs
+  unprivileged on the user's session bus, managed by `systemd --user`, with
+  device access delegated via `udev` + `uaccess`. The legacy system-bus DBus
+  policy and `User=root` activation are no longer used. See
+  [Session Bus Migration](#session-bus-migration-breaking-change-for-piper).
 - **License change** — the Rust daemon (`ratbagd-rs/`) is licensed under
   **GPLv3**. Supporting assets (service templates, device data, docs) remain
   under MIT/Expat (see the License section below).
@@ -64,9 +117,9 @@ The core `ratbagd` daemon has been rewritten from C to Rust. Key changes:
 
 - The `org.freedesktop.ratbag1` DBus API (version 2) — all interfaces
   (`Manager`, `Device`, `Profile`, `Resolution`, `Button`, `LED`) are
-  wire-compatible with the C daemon.
+  wire-compatible with the C daemon (but now served on the **session** bus;
+  see [Session Bus Migration](#session-bus-migration-breaking-change-for-piper)).
 - The `.device` file database in `data/devices/`.
-- systemd and DBus service activation configuration.
 
 Installing libratbag-rs from system packages
 ---------------------------------------------
@@ -300,7 +353,7 @@ The DBus Interface
 Full documentation of the DBus interface to interact with devices is
 available here: [ratbagd DBus Interface description](https://libratbag.github.io/).
 
-The daemon exposes the following interfaces on the system bus under
+The daemon exposes the following interfaces on the session bus under
 `org.freedesktop.ratbag1`:
 
 | Interface | Object Path | Description |

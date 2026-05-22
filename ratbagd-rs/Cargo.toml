@@ -1,6 +1,6 @@
 [package]
 name = "ratbagd-rs"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["Nilton Perim Neto <niltonperimneto@gmail.com>"]
 edition = "2024"
 description = "A Rust rewrite of the ratbagd daemon for configuring gaming mice"
