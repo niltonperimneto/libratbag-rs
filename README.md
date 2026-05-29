@@ -8,11 +8,8 @@ mainly gaming mice. The daemon provides a generic way to access the various
 features exposed by these mice and abstracts away hardware-specific and
 kernel-specific quirks.
 
-**As of version 2.0, the ratbagd daemon has been rewritten in Rust
-(`ratbagd-rs`) and migrated to an unprivileged session daemon.** The new daemon speaks the same `org.freedesktop.ratbag1`
-DBus API (version 2) and uses the same device database and `.device` files.
-The old C daemon has been removed and the CLI replaced with a new Rust
-`ratbagctl` tool built on the same DBus API.
+**As of version 2.0, the ratbagd daemon has been rewritten in Rust and migrated to an unprivileged session daemon.** The daemon and the companion `ratbagctl` CLI tool are consolidated in a unified codebase. The daemon speaks the same `org.freedesktop.ratbag1` DBus API (version 2) and uses the same device database and `.device` files.
+The old C daemon has been removed and the CLI replaced with a new Rust `ratbagctl` tool built on the same DBus API.
 
 > ⚠️ **Breaking change: ratbagd now runs on the session bus, not the system
 > bus.** This intentionally breaks compatibility with current
@@ -24,7 +21,7 @@ The old C daemon has been removed and the CLI replaced with a new Rust
 Session Bus Migration (Breaking Change for Piper)
 -------------------------------------------------
 
-`ratbagd-rs` no longer runs as a `root` system daemon on the **system bus**.
+`ratbagd` no longer runs as a `root` system daemon on the **system bus**.
 It now runs as an unprivileged **session daemon** on the user's **session
 bus** (`zbus::Connection::session()`), spawned and managed by
 `systemd --user`. Device access is granted to the physically seated user via
@@ -109,9 +106,7 @@ The core `ratbagd` daemon has been rewritten from C to Rust. Key changes:
   device access delegated via `udev` + `uaccess`. The legacy system-bus DBus
   policy and `User=root` activation are no longer used. See
   [Session Bus Migration](#session-bus-migration-breaking-change-for-piper).
-- **License change** — the Rust daemon (`ratbagd-rs/`) is licensed under
-  **GPLv3**. Supporting assets (service templates, device data, docs) remain
-  under MIT/Expat (see the License section below).
+- **License change** — the Rust daemon is licensed under **GPLv3**. Supporting assets (service templates, device data, docs) remain under MIT/Expat (see the License section below).
 
 ### What stays the same
 
@@ -121,17 +116,16 @@ The core `ratbagd` daemon has been rewritten from C to Rust. Key changes:
   see [Session Bus Migration](#session-bus-migration-breaking-change-for-piper)).
 - The `.device` file database in `data/devices/`.
 
-Installing libratbag-rs from system packages
----------------------------------------------
+Installing libratbag from system packages
+-----------------------------------------
 
-libratbag-rs is not yet packaged for distributions. See the
+libratbag is not yet packaged for distributions. See the
 [Compiling](#compiling-libratbag) section below to build from source.
 
 Build Requirements
 ------------------
 
-- **Rust toolchain** — a stable Rust compiler (Rust 1.85+; edition 2024 for
-  `ratbagd-rs`, edition 2021 for `ratbagctl-rs`) and Cargo.
+- **Rust toolchain** — a stable Rust compiler (Rust 1.85+; edition 2024) and Cargo.
   Install via [rustup](https://rustup.rs/) or your distribution's package
   manager.
 - **Meson** (>= 0.59) and **Ninja**.
@@ -142,7 +136,7 @@ Build Requirements
 
 The Rust daemon itself depends on `tokio`, `zbus`, `nix`, `udev`, `serde`,
 `tracing`, and other crates — Cargo resolves these automatically. The CLI
-tool (`ratbagctl-rs/`) depends on `clap`, `zbus`, `tokio`, and `anyhow`.
+binary target (`ratbagctl`) depends on `clap`, `zbus`, `tokio`, and `anyhow`.
 `Cargo.lock` files are committed for reproducible builds
 (`cargo build --locked`).
 
@@ -192,8 +186,7 @@ Notable options:
 To enable the synthetic test device DBus methods, edit the Cargo build
 flags in `meson.build` or build the Rust crate directly:
 
-    cd ratbagd-rs
-    cargo build --release --features dev-hooks
+    cargo build --release --bin ratbagd --features dev-hooks
 
 **Never enable `dev-hooks` in production builds.**
 
@@ -234,7 +227,7 @@ automatically start the Rust daemon through DBus activation.
 ### Verifying the Rust daemon is running
 
     systemctl status ratbagd
-    journalctl -u ratbagd -n 20   # should show "Starting ratbagd-rs version ..."
+    journalctl -u ratbagd -n 20   # should show "Starting ratbagd version ..."
 
 You can also start it directly for debugging:
 
@@ -372,9 +365,9 @@ Architecture
 
     +---------+
     | Twister |--+
-    +---------+  |   +------+    +-------------------+
-                 +-> | DBus | -> | ratbagd-rs (Rust) | -> /dev/hidraw*
-    +---------+  |   +------+    +-------------------+
+    +---------+  |   +------+    +-----------------+
+                 +-> | DBus | -> | ratbagd (Rust)  | -> /dev/hidraw*
+    +---------+  |   +------+    +-----------------+
     |  Piper  |--+                      |
     +---------+               +------+------+
                               | Device Actor | (one per mouse, owns DeviceIo)
@@ -386,20 +379,20 @@ Architecture
 
 ### Internal Rust architecture
 
-- **`main.rs`** — entry point; initializes tracing, loads the device
+- **`src/main.rs`** — entry point; initializes tracing, loads the device
   database, spawns the udev monitor, and starts the DBus server.
-- **`dbus/`** — zbus interface implementations for `Manager`, `Device`,
+- **`src/ipc/`** — zbus interface implementations for `Manager`, `Device`,
   `Profile`, `Resolution`, `Button`, and `LED`.
-- **`actor.rs`** — per-device actor task that serializes hardware I/O.
+- **`src/engine/actor.rs`** — per-device actor task that serializes hardware I/O.
   DBus handlers send `ActorCommand` messages; the actor executes them
   against the `DeviceDriver` + `DeviceIo`.
-- **`driver/`** — the `DeviceDriver` trait and all protocol implementations.
+- **`src/hal/`** — the `DeviceDriver` trait and all protocol implementations.
   `DeviceIo` wraps async hidraw I/O with feature report ioctl support.
-- **`device.rs`** — `DeviceInfo` and its children (`ProfileInfo`,
+- **`src/engine/device.rs`** — `DeviceInfo` and its children (`ProfileInfo`,
   `ResolutionInfo`, `ButtonInfo`, `LedInfo`) — the canonical device state
   shared between DBus objects and the actor via `Arc<RwLock<…>>`.
-- **`device_database.rs`** — parser for `.device` files (INI-like config).
-- **`udev_monitor.rs`** — monitors hidraw device add/remove events and
+- **`src/engine/device_database.rs`** — parser for `.device` files (INI-like config).
+- **`src/udev_monitor.rs`** — monitors hidraw device add/remove events and
   sends `DeviceAction` messages to the main event loop.
 
 Adding Devices to libratbag
@@ -449,9 +442,9 @@ License
 
 This project uses a **dual-license** structure:
 
-- **ratbagd-rs** (the Rust daemon in `ratbagd-rs/`) is licensed under the
+- **ratbagd** (the Rust daemon in `src/`) is licensed under the
   **GNU General Public License v3.0 (GPLv3)**.
-- **ratbagctl-rs** (the CLI tool in `ratbagctl-rs/`) is licensed under the
+- **ratbagctl** (the CLI tool in `src/bin/ratbagctl/`) is licensed under the
   **GNU General Public License v3.0 or later (GPL-3.0-or-later)**.
 - **Twister** (the desktop GUI in `twister/`) is licensed under the
   **GNU General Public License v3.0 or later (GPL-3.0-or-later)**.
@@ -465,5 +458,5 @@ This project uses a **dual-license** structure:
 > and/or sell copies of the Software, and to permit persons to whom the
 > Software is furnished to do so, subject to the following conditions: [...]
 
-See the [COPYING](COPYING) file for the MIT license and
-`ratbagd-rs/Cargo.toml` for the GPLv3 declaration.
+See the [LICENSE](LICENSE) file for the MIT license and
+[Cargo.toml](Cargo.toml) for the GPLv3 declaration.
