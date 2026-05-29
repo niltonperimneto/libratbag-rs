@@ -322,7 +322,11 @@ impl RatbagClient {
         let inner: Value<'_> = val.into();
         if let Value::Structure(s) = &inner {
             if let [Value::U32(action_type), variant] = s.fields() {
-                let display = match variant {
+                let mut unwrapped = variant;
+                while let Value::Value(inner) = unwrapped {
+                    unwrapped = inner.as_ref();
+                }
+                let display = match unwrapped {
                     Value::U32(v) => v.to_string(),
                     Value::Array(arr) => {
                         // Decode macro entries: Vec<(u32, u32)> = (keycode, direction)
