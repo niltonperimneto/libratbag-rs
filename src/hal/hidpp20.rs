@@ -60,6 +60,20 @@ const PROFILES_FN_MEMORY_WRITE_END: u8 = 0x08;
 const PROFILES_FN_GET_CURRENT_DPI_INDEX: u8 = 0x0B;
 const PROFILES_FN_SET_CURRENT_DPI_INDEX: u8 = 0x0C;
 
+/* Feature 0x1b04 (Special Keys / Reprogrammable Controls) function IDs. */
+const SPECIAL_KEYS_FN_GET_COUNT: u8 = 0x00;
+
+/* Action types a HID++ 2.0 button can be remapped to.  Mirrors the C driver:
+ * a button binding may be a mouse button, keyboard key, special action, or
+ * macro.  Exposed via the button's ActionTypes D-Bus property so clients
+ * (Piper/Twister) know what mappings are offerable. */
+const HIDPP20_BUTTON_ACTION_TYPES: &[u32] = &[
+    crate::engine::device::ActionType::Button as u32,
+    crate::engine::device::ActionType::Key as u32,
+    crate::engine::device::ActionType::Special as u32,
+    crate::engine::device::ActionType::Macro as u32,
+];
+
 /* Onboard profile sector addresses — must match the C constants
  * HIDPP20_USER_PROFILES_G402 and HIDPP20_ROM_PROFILES_G402. */
 const USER_PROFILES_BASE: u16 = 0x0000;
@@ -511,6 +525,36 @@ impl Hidpp20Driver {
                 Err(anyhow::anyhow!(
                     "HID++ error {name} (0x{code:02X}) for feature 0x{feature_index:02X} fn={function}"
                 ))
+            }
+        }
+    }
+
+    /* Query the number of reprogrammable controls exposed by the
+     * Special Keys / Buttons feature (0x1b04, function getCount).
+     *
+     * This is the canonical button enumerator in the C driver
+     * (hidpp20_1b04_get_controls).  We use it as the source of truth for how
+     * many button objects to expose when the onboard-profiles descriptor does
+     * not provide a usable button_count (e.g. the G305, whose EEPROM may be
+     * uninitialised, or any host-managed device without 0x8100).
+     *
+     * Returns 0 when the feature is absent or the request fails. */
+    async fn query_special_keys_count(&self, io: &mut DeviceIo) -> usize {
+        let Some(idx) = self.features.special_keys else {
+            return 0;
+        };
+        match self
+            .feature_request(io, idx, SPECIAL_KEYS_FN_GET_COUNT, &[])
+            .await
+        {
+            Ok(resp) => {
+                let count = resp[0] as usize;
+                info!("HID++ 2.0: special keys/buttons (0x1b04) reports {count} controls");
+                count
+            }
+            Err(e) => {
+                debug!("HID++ 2.0: failed to query special keys count: {e}");
+                0
             }
         }
     }
@@ -1234,7 +1278,22 @@ impl super::DeviceDriver for Hidpp20Driver {
                 profile_count = 5;
             }
 
-            let button_count = desc.button_count as usize;
+            /* The onboard descriptor's button_count is the primary source, but
+             * some firmware (notably the G305 with uninitialised EEPROM) reports
+             * 0 here even though the device has remappable buttons.  Fall back to
+             * the Special Keys/Buttons feature (0x1b04) count so the button
+             * objects still get exposed on D-Bus. */
+            let mut button_count = desc.button_count as usize;
+            if button_count == 0 {
+                let special_keys_count = self.query_special_keys_count(io).await;
+                if special_keys_count > 0 {
+                    info!(
+                        "HID++ 2.0: onboard descriptor button_count=0; \
+                         using 0x1b04 control count {special_keys_count} instead"
+                    );
+                    button_count = special_keys_count;
+                }
+            }
 
             info!(
                 "HID++ 2.0: Hardware described profiles={} (oob={}) buttons={} sector_size={}",
@@ -1282,6 +1341,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                     .resize_with(button_count, crate::engine::device::ButtonInfo::default);
                 for (b_idx, b) in p.buttons.iter_mut().enumerate() {
                     b.index = b_idx as u32;
+                    b.action_types = HIDPP20_BUTTON_ACTION_TYPES.to_vec();
                 }
             }
 
@@ -1557,6 +1617,21 @@ impl super::DeviceDriver for Hidpp20Driver {
             info!("HID++ 2.0: no onboard profiles feature; using single host-managed profile");
             if info.profiles.is_empty() {
                 info.profiles.push(ProfileInfo::default());
+            }
+
+            /* Without onboard profiles there is no descriptor button_count, so
+             * enumerate buttons from the Special Keys/Buttons feature (0x1b04).
+             * Size each profile's button list to match the hardware controls. */
+            let button_count = self.query_special_keys_count(io).await;
+            if button_count > 0 {
+                for p in &mut info.profiles {
+                    p.buttons
+                        .resize_with(button_count, crate::engine::device::ButtonInfo::default);
+                    for (b_idx, b) in p.buttons.iter_mut().enumerate() {
+                        b.index = b_idx as u32;
+                        b.action_types = HIDPP20_BUTTON_ACTION_TYPES.to_vec();
+                    }
+                }
             }
         }
 
