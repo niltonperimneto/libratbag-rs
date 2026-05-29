@@ -24,15 +24,15 @@ from .ratbag_dbus import RatbagDBusClient
 
 def _load_and_get_device(client: RatbagDBusClient, json_str: str) -> str:
     """Load a test device and return its object path. Retries briefly."""
-    client.load_test_device(json_str)
+    expected_path = client.load_test_device(json_str)
     # Give the daemon a moment to register the device on DBus
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         devices = client.manager_devices()
-        if devices:
-            return devices[-1]
+        if expected_path in devices:
+            return expected_path
         time.sleep(0.1)
-    pytest.fail("Test device did not appear in Devices list within timeout")
+    pytest.fail(f"Test device {expected_path} did not appear in Devices list within timeout")
 
 
 # ===========================================================================

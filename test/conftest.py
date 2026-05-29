@@ -198,6 +198,7 @@ SEPARATE_DPI_DEVICE_JSON = json.dumps(
                     {
                         "xres": 800,
                         "yres": 1600,
+                        "capabilities": [2],
                         "is_active": True,
                         "is_default": True,
                     }

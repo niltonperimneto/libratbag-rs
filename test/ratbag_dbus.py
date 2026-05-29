@@ -82,9 +82,10 @@ class RatbagDBusClient:
         paths = self._get_property(MANAGER_PATH, MANAGER_IFACE, "Devices")
         return [str(p) for p in paths]
 
-    def load_test_device(self, json_str: str):
+    def load_test_device(self, json_str: str) -> str:
         """Inject a synthetic test device (requires dev-hooks)."""
-        self._call_method(MANAGER_PATH, MANAGER_IFACE, "LoadTestDevice", json_str)
+        sysname = self._call_method(MANAGER_PATH, MANAGER_IFACE, "LoadTestDevice", json_str)
+        return f"/org/freedesktop/ratbag1/device/{sysname}"
 
     def load_test_device_with_driver(
         self, driver_name: str, config_json: str, io_script_json: str

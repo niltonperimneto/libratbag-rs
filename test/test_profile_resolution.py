@@ -25,14 +25,14 @@ pytestmark = pytest.mark.requires_dev_hooks
 
 
 def _load_and_get_device(client: RatbagDBusClient, json_str: str) -> str:
-    client.load_test_device(json_str)
+    expected_path = client.load_test_device(json_str)
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         devices = client.manager_devices()
-        if devices:
-            return devices[-1]
+        if expected_path in devices:
+            return expected_path
         time.sleep(0.1)
-    pytest.fail("Test device did not appear within timeout")
+    pytest.fail(f"Test device {expected_path} did not appear within timeout")
 
 
 def _first_profile(client: RatbagDBusClient, device_path: str) -> str:

@@ -23,14 +23,14 @@ pytestmark = pytest.mark.requires_dev_hooks
 
 
 def _load_and_get_device(client: RatbagDBusClient, json_str: str) -> str:
-    client.load_test_device(json_str)
+    expected_path = client.load_test_device(json_str)
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         devices = client.manager_devices()
-        if devices:
-            return devices[-1]
+        if expected_path in devices:
+            return expected_path
         time.sleep(0.1)
-    pytest.fail("Test device did not appear within timeout")
+    pytest.fail(f"Test device {expected_path} did not appear within timeout")
 
 
 def _first_profile(client: RatbagDBusClient, device_path: str) -> str:
@@ -149,7 +149,7 @@ class TestRoundTrip:
 
         # Mutate LED
         leds = dbus_client.profile_leds(profile)
-        dbus_client.set_led_mode(leds[0], 10)  # Breathing
+        dbus_client.set_led_mode(leds[0], 3)  # Breathing
         dbus_client.set_led_color(leds[0], 0, 255, 128)
         dbus_client.set_led_brightness(leds[0], 180)
 
@@ -162,7 +162,7 @@ class TestRoundTrip:
         assert int(mapping[0]) == 3  # Key
         assert int(mapping[1]) == 30
 
-        assert dbus_client.led_mode(leds[0]) == 10
+        assert dbus_client.led_mode(leds[0]) == 3
         r, g, b = dbus_client.led_color(leds[0])
         assert (r, g, b) == (0, 255, 128)
         assert dbus_client.led_brightness(leds[0]) == 180
