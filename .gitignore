@@ -16,3 +16,4 @@ ratbagd
 node_modules
 .claude/
 .gemini/
+SESSION_DAEMON_PLAN.md

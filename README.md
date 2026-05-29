@@ -59,9 +59,6 @@ as per-user preferences and behaves sensibly on multi-user systems, where the
 kernel's seat management (`systemd-logind`) grants hardware access only to the
 physically seated user.
 
-See [SESSION_DAEMON_PLAN.md](SESSION_DAEMON_PLAN.md) for the full
-architectural rationale and roadmap.
-
 Supported Devices
 -----------------
 
