@@ -1,4 +1,4 @@
-ratbagd-rs/target/*
+target/
 .idea/
 .vscode/
 *.swp
@@ -7,15 +7,12 @@ ratbagd-rs/target/*
 .DS_Store
 builddir/
 Thumbs.db
-ratbagctl-rs/target/*
 .agents/
 .github/
-test/
 *.c
 *.h
-.claude/skills/linux-driver/SKILL.md
-.claude/rules/rust-linux-devel.instructions.md
-ratbagctl-rs/ratbagctl
-ratbagd-rs/ratbagd
+ratbagctl
+ratbagd
 node_modules
-.claude/settings.local.json
+.claude/
+.gemini/
