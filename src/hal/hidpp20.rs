@@ -87,9 +87,15 @@ const ONBOARD_MODE_ONBOARD: u8 = 0x01;
 const ONBOARD_MODE_HOST: u8 = 0x02;
 
 /* EEPROM profile sector layout constants.
- * The C struct `hidpp20_profile` places leds[HIDPP20_LED_COUNT] at byte
- * offset 208 inside the 256-byte packed union.  Each LED occupies 11
- * bytes (`struct hidpp20_internal_led`). */
+ * The C struct `hidpp20_profile` is a packed union inside the 256-byte
+ * sector; the offsets below mirror it field-for-field. */
+const EEPROM_REPORT_INTERVAL_OFFSET: usize = 0;
+const EEPROM_DEFAULT_DPI_OFFSET: usize = 1;
+const EEPROM_DPI_OFFSET: usize = 3;
+const EEPROM_DPI_COUNT: usize = 5;
+const EEPROM_BUTTON_OFFSET: usize = 32;
+const EEPROM_BUTTON_SIZE: usize = 4;
+const EEPROM_MAX_BUTTONS: usize = 16;
 const EEPROM_LED_OFFSET: usize = 208;
 const EEPROM_LED_SIZE: usize = 11;
 const EEPROM_LED_COUNT: usize = 2;
@@ -121,7 +127,7 @@ impl FeatureMap {
 }
 
 /* HID++ 2.0 Button Binding representation (4 bytes) */
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hidpp20ButtonBinding {
     pub button_type: u8,
     pub subtype: u8,
@@ -208,6 +214,112 @@ impl Hidpp20ButtonBinding {
             button_type,
             subtype,
             control_id_or_macro_id: control_id.to_le_bytes(),
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* EEPROM profile sector layout                                           */
+/* ---------------------------------------------------------------------- */
+
+/* The positional layout of one onboard-profile EEPROM sector.
+ *
+ * This owns only *where* each field lives in the sector — not the semantic
+ * encoding of button mappings (bitmask ↔ ordinal, special opcodes) or LED
+ * modes, which stays with the callers and the `Hidpp20ButtonBinding` /
+ * `*_eeprom_led` helpers.  Centralising the offsets here keeps `load_profiles`
+ * and `commit` from each hand-coding the same magic numbers.
+ *
+ * Sector layout (mirrors the C packed `hidpp20_profile` union):
+ *   [0]        report interval in ms (0 = unset)
+ *   [1]        default DPI slot index
+ *   [3..13]    5 × DPI value, little-endian u16 (0 / 0xFFFF = disabled slot)
+ *   [32..]     buttons, 4 bytes each (`Hidpp20ButtonBinding`)
+ *   [208..]    LEDs, 11 bytes each (`EEPROM_LED_COUNT` entries)
+ *   [len-2..]  CCITT CRC, big-endian — owned by the caller, not this struct
+ *
+ * The vectors hold only the slots that physically fit in the sector, matching
+ * the bounds checks on both read and write paths. */
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct EepromProfile {
+    report_interval: u8,
+    default_dpi_index: u8,
+    dpis: Vec<u16>,
+    buttons: Vec<Hidpp20ButtonBinding>,
+    leds: Vec<[u8; EEPROM_LED_SIZE]>,
+}
+
+impl EepromProfile {
+    /* Decode the typed slots out of a sector buffer.  `button_count` is the
+     * device's hardware button count (capped at `EEPROM_MAX_BUTTONS`). */
+    fn from_bytes(data: &[u8], button_count: usize) -> Self {
+        let report_interval = data.get(EEPROM_REPORT_INTERVAL_OFFSET).copied().unwrap_or(0);
+        let default_dpi_index = data.get(EEPROM_DEFAULT_DPI_OFFSET).copied().unwrap_or(0);
+
+        let mut dpis = Vec::new();
+        for i in 0..EEPROM_DPI_COUNT {
+            let off = EEPROM_DPI_OFFSET + i * 2;
+            if off + 2 <= data.len() {
+                dpis.push(u16::from_le_bytes([data[off], data[off + 1]]));
+            }
+        }
+
+        let mut buttons = Vec::new();
+        for b in 0..button_count.min(EEPROM_MAX_BUTTONS) {
+            let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
+            if off + EEPROM_BUTTON_SIZE <= data.len() {
+                let mut bytes = [0u8; EEPROM_BUTTON_SIZE];
+                bytes.copy_from_slice(&data[off..off + EEPROM_BUTTON_SIZE]);
+                buttons.push(Hidpp20ButtonBinding::from_bytes(&bytes));
+            }
+        }
+
+        let mut leds = Vec::new();
+        for l in 0..EEPROM_LED_COUNT {
+            let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
+            if off + EEPROM_LED_SIZE <= data.len() {
+                let mut bytes = [0u8; EEPROM_LED_SIZE];
+                bytes.copy_from_slice(&data[off..off + EEPROM_LED_SIZE]);
+                leds.push(bytes);
+            }
+        }
+
+        Self {
+            report_interval,
+            default_dpi_index,
+            dpis,
+            buttons,
+            leds,
+        }
+    }
+
+    /* Write the owned fields back into `data` at their sector offsets, leaving
+     * all other bytes (and the trailing CRC) untouched.  Slots that would
+     * overflow `data` are skipped, mirroring `from_bytes`. */
+    fn write_into(&self, data: &mut [u8]) {
+        if let Some(b) = data.get_mut(EEPROM_REPORT_INTERVAL_OFFSET) {
+            *b = self.report_interval;
+        }
+        if let Some(b) = data.get_mut(EEPROM_DEFAULT_DPI_OFFSET) {
+            *b = self.default_dpi_index;
+        }
+        for (i, &dpi) in self.dpis.iter().enumerate().take(EEPROM_DPI_COUNT) {
+            let off = EEPROM_DPI_OFFSET + i * 2;
+            if off + 2 <= data.len() {
+                data[off..off + 2].copy_from_slice(&dpi.to_le_bytes());
+            }
+        }
+        for (b, binding) in self.buttons.iter().enumerate().take(EEPROM_MAX_BUTTONS) {
+            let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
+            if off + EEPROM_BUTTON_SIZE <= data.len() {
+                data[off..off + EEPROM_BUTTON_SIZE].copy_from_slice(&binding.into_bytes());
+            }
+        }
+        for (l, led) in self.leds.iter().enumerate().take(EEPROM_LED_COUNT) {
+            let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
+            if off + EEPROM_LED_SIZE <= data.len() {
+                data[off..off + EEPROM_LED_SIZE].copy_from_slice(led);
+            }
         }
     }
 }
@@ -1495,53 +1607,40 @@ impl super::DeviceDriver for Hidpp20Driver {
                 let p = &mut info.profiles[i];
                 p.is_enabled = enabled;
 
+                let eeprom = EepromProfile::from_bytes(&profile_data, button_count);
+
                 /* --- Report rate (byte 0): stored as ms-interval, convert to Hz --- */
-                if !profile_data.is_empty() && profile_data[0] > 0 {
-                    p.report_rate = 1000 / (profile_data[0] as u32);
+                if eeprom.report_interval > 0 {
+                    p.report_rate = 1000 / (eeprom.report_interval as u32);
                     debug!(
                         "HID++ 2.0: profile {i} EEPROM report rate = {} Hz (interval {}ms)",
-                        p.report_rate, profile_data[0]
+                        p.report_rate, eeprom.report_interval
                     );
                 }
 
-                /* --- DPI list (bytes 3-12): 5 entries × 2 bytes LE --- */
-                /* A raw value of 0 means the resolution slot is disabled  */
-                /* but the slot must still appear on DBus with             */
-                /* IsDisabled = true, matching the C daemon's behaviour.   */
-                /* Piper expects to see all slots so users can enable them. */
-                let mut eeprom_dpis: Vec<(u32, bool)> = Vec::new();
-                for d_idx in 0..5usize {
-                    let d_off = 3 + d_idx * 2;
-                    if d_off + 2 <= profile_data.len() {
-                        let raw =
-                            u16::from_le_bytes([profile_data[d_off], profile_data[d_off + 1]]);
-                        if raw == 0 || raw == 0xFFFF {
-                            eeprom_dpis.push((0, true));
-                        } else {
-                            eeprom_dpis.push((u32::from(raw), false));
-                        }
-                    }
-                }
-
-                /* Default-DPI index (byte 1) */
-                let default_dpi_idx = if profile_data.len() > 1 {
-                    profile_data[1] as usize
-                } else {
-                    0
-                };
-
-                if !eeprom_dpis.is_empty() {
+                /* --- DPI slots --- */
+                /* A raw value of 0 or 0xFFFF means the resolution slot is     */
+                /* disabled, but the slot must still appear on DBus with       */
+                /* IsDisabled = true (Piper shows all slots so users can       */
+                /* re-enable them), matching the C daemon's behaviour.         */
+                let default_dpi_idx = eeprom.default_dpi_index as usize;
+                if !eeprom.dpis.is_empty() {
                     debug!(
                         "HID++ 2.0: profile {i} EEPROM DPIs: {:?} (default idx {})",
-                        eeprom_dpis, default_dpi_idx
+                        eeprom.dpis, default_dpi_idx
                     );
 
                     /* Rebuild the resolutions list to match the EEPROM entries. */
                     p.resolutions.clear();
-                    for (r_idx, &(dpi_val, disabled)) in eeprom_dpis.iter().enumerate() {
+                    for (r_idx, &raw) in eeprom.dpis.iter().enumerate() {
+                        let disabled = raw == 0 || raw == 0xFFFF;
                         p.resolutions.push(crate::engine::device::ResolutionInfo {
                             index: r_idx as u32,
-                            dpi: crate::engine::device::Dpi::Unified(dpi_val),
+                            dpi: crate::engine::device::Dpi::Unified(if disabled {
+                                0
+                            } else {
+                                u32::from(raw)
+                            }),
                             dpi_list: Vec::new(), /* filled later by read_dpi_info */
                             capabilities: Vec::new(),
                             is_active: !disabled && r_idx == default_dpi_idx,
@@ -1551,65 +1650,45 @@ impl super::DeviceDriver for Hidpp20Driver {
                     }
                 }
 
-                /* --- Buttons (offset 32, 4 bytes each) --- */
-                let max_buttons = button_count.min(16);
-                for b_idx in 0..max_buttons {
-                    let btn_offset = 32 + (b_idx * 4);
-                    if btn_offset + 4 <= profile_data.len() {
-                        let mut binding_bytes = [0u8; 4];
-                        binding_bytes.copy_from_slice(&profile_data[btn_offset..btn_offset + 4]);
-                        let binding = Hidpp20ButtonBinding::from_bytes(&binding_bytes);
+                /* --- Buttons --- */
+                for (b_idx, binding) in eeprom.buttons.iter().enumerate() {
+                    p.buttons[b_idx].action_type = binding.to_action();
 
-                        p.buttons[b_idx].action_type = binding.to_action();
-
-                        /* EEPROM mouse buttons are stored as a big-endian bit mask
-                         * (matching the C hidpp20_buttons_to_cpu / buttons_from_cpu).
-                         * ffs(mask) gives the 1-based button ordinal. */
-                        let raw_id = u16::from_be_bytes(binding.control_id_or_macro_id);
-                        let mapping_value = match (binding.button_type, binding.subtype) {
-                            /* EEPROM mouse buttons are stored as a big-endian bit mask.
-                             * ffs(mask) gives the 1-based button ordinal. */
-                            (BUTTON_TYPE_HID, BUTTON_SUBTYPE_MOUSE) => {
-                                if raw_id > 0 {
-                                    u32::from(raw_id.trailing_zeros()) + 1
-                                } else {
-                                    0
-                                }
+                    /* EEPROM mouse buttons are stored as a big-endian bit mask
+                     * (matching the C hidpp20_buttons_to_cpu / buttons_from_cpu).
+                     * ffs(mask) gives the 1-based button ordinal. */
+                    let raw_id = u16::from_be_bytes(binding.control_id_or_macro_id);
+                    let mapping_value = match (binding.button_type, binding.subtype) {
+                        (BUTTON_TYPE_HID, BUTTON_SUBTYPE_MOUSE) => {
+                            if raw_id > 0 {
+                                u32::from(raw_id.trailing_zeros()) + 1
+                            } else {
+                                0
                             }
-                            /* Translate the raw HID++ special opcode to the
-                             * canonical special_action constant for DBus. */
-                            (BUTTON_TYPE_SPECIAL, _) => hidpp20_raw_to_special(raw_id as u8),
-                            _ => u32::from(raw_id),
-                        };
-                        p.buttons[b_idx].mapping_value = mapping_value;
+                        }
+                        /* Translate the raw HID++ special opcode to the
+                         * canonical special_action constant for DBus. */
+                        (BUTTON_TYPE_SPECIAL, _) => hidpp20_raw_to_special(raw_id as u8),
+                        _ => u32::from(raw_id),
+                    };
+                    p.buttons[b_idx].mapping_value = mapping_value;
 
-                        debug!(
-                            "HID++ 2.0: profile {i} button {b_idx}: \
-                             type=0x{:02X} sub=0x{:02X} raw=[{:02X},{:02X}] \
-                             → action={:?} mapping={mapping_value}",
-                            binding.button_type,
-                            binding.subtype,
-                            binding.control_id_or_macro_id[0],
-                            binding.control_id_or_macro_id[1],
-                            p.buttons[b_idx].action_type
-                        );
-                    }
+                    debug!(
+                        "HID++ 2.0: profile {i} button {b_idx}: \
+                         type=0x{:02X} sub=0x{:02X} raw=[{:02X},{:02X}] \
+                         → action={:?} mapping={mapping_value}",
+                        binding.button_type,
+                        binding.subtype,
+                        binding.control_id_or_macro_id[0],
+                        binding.control_id_or_macro_id[1],
+                        p.buttons[b_idx].action_type
+                    );
                 }
 
-                /* --- LEDs (offset 208, 2 × 11 bytes) --- *
-                 * The C struct places leds[HIDPP20_LED_COUNT] at offset 208
-                 * inside the 256-byte packed union.  Each LED is 11 bytes
-                 * (hidpp20_internal_led).  Parse them into the profile. */
+                /* --- LEDs --- */
                 p.leds.clear();
-                for led_idx in 0..EEPROM_LED_COUNT {
-                    let off = EEPROM_LED_OFFSET + led_idx * EEPROM_LED_SIZE;
-                    if off + EEPROM_LED_SIZE <= profile_data.len() {
-                        let led = Self::parse_eeprom_led(
-                            &profile_data[off..off + EEPROM_LED_SIZE],
-                            led_idx,
-                        );
-                        p.leds.push(led);
-                    }
+                for (led_idx, led_bytes) in eeprom.leds.iter().enumerate() {
+                    p.leds.push(Self::parse_eeprom_led(led_bytes, led_idx));
                 }
             }
         } else {
@@ -1860,57 +1939,53 @@ impl super::DeviceDriver for Hidpp20Driver {
                         data
                     };
 
-                    /* 1. Report rate (byte 0): stored as ms-interval */
+                    /* Decode the read-back sector, patch the fields ratbag
+                     * manages, then write them back.  Starting from the
+                     * existing bytes preserves every slot we don't touch
+                     * (and any device-private fields between them). */
+                    let mut eeprom =
+                        EepromProfile::from_bytes(&profile_data, desc.button_count as usize);
+
+                    /* 1. Report rate (byte 0): Hz → ms-interval. */
                     if profile.report_rate > 0 {
-                        profile_data[0] =
+                        eeprom.report_interval =
                             (1000 / profile.report_rate).min(u32::from(u8::MAX)) as u8;
                     }
 
-                    /* 2. Default-DPI index (byte 1) */
+                    /* 2. Default-DPI index (byte 1). */
                     if let Some(def_idx) = profile.resolutions.iter().position(|r| r.is_default) {
-                        profile_data[1] = def_idx as u8;
+                        eeprom.default_dpi_index = def_idx as u8;
                     }
 
-                    /* 3. DPI list (bytes 3-12, 5 × LE u16) */
-                    for (i, res) in profile.resolutions.iter().enumerate().take(5) {
+                    /* 3. DPI list. */
+                    for (i, res) in profile.resolutions.iter().enumerate().take(EEPROM_DPI_COUNT) {
                         if let Dpi::Unified(val) = res.dpi {
-                            let dpi_bytes = (val.min(u32::from(u16::MAX)) as u16).to_le_bytes();
-                            profile_data[3 + i * 2] = dpi_bytes[0];
-                            profile_data[3 + i * 2 + 1] = dpi_bytes[1];
+                            if i < eeprom.dpis.len() {
+                                eeprom.dpis[i] = val.min(u32::from(u16::MAX)) as u16;
+                            }
                         }
                     }
 
-                    /* 4. Buttons (offset 32, 4 bytes each) */
-                    let max_buttons = desc.button_count.min(16) as usize;
+                    /* 4. Buttons. */
                     for btn in &profile.buttons {
                         let b_idx = btn.index as usize;
-                        if b_idx < max_buttons {
-                            let btn_offset = 32 + b_idx * 4;
-                            if btn_offset + 4 <= profile_data.len() {
-                                let binding = Hidpp20ButtonBinding::from_action(
-                                    btn.action_type,
-                                    btn.mapping_value,
-                                );
-                                profile_data[btn_offset..btn_offset + 4]
-                                    .copy_from_slice(&binding.into_bytes());
-                            }
+                        if b_idx < eeprom.buttons.len() {
+                            eeprom.buttons[b_idx] = Hidpp20ButtonBinding::from_action(
+                                btn.action_type,
+                                btn.mapping_value,
+                            );
                         }
                     }
 
-                    /* 5. LEDs (offset 208, 2 × 11 bytes) */
-                    {
-                        for led in &profile.leds {
-                            let led_idx = led.index as usize;
-                            if led_idx < EEPROM_LED_COUNT {
-                                let off = EEPROM_LED_OFFSET + led_idx * EEPROM_LED_SIZE;
-                                if off + EEPROM_LED_SIZE <= profile_data.len() {
-                                    let led_data = Self::serialize_eeprom_led(led);
-                                    profile_data[off..off + EEPROM_LED_SIZE]
-                                        .copy_from_slice(&led_data);
-                                }
-                            }
+                    /* 5. LEDs. */
+                    for led in &profile.leds {
+                        let led_idx = led.index as usize;
+                        if led_idx < eeprom.leds.len() {
+                            eeprom.leds[led_idx] = Self::serialize_eeprom_led(led);
                         }
                     }
+
+                    eeprom.write_into(&mut profile_data);
 
                     /* 6. Recompute CRC (last 2 bytes, BE) */
                     let crc_offset = profile_data.len() - 2;
@@ -2151,5 +2226,86 @@ impl super::DeviceDriver for Hidpp20Driver {
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /* Build a 256-byte sector with recognisable values at every managed
+     * offset, plus sentinel bytes in the gaps that must survive a round trip. */
+    fn sample_sector() -> Vec<u8> {
+        let mut data = vec![0u8; 256];
+        data[EEPROM_REPORT_INTERVAL_OFFSET] = 1; /* 1 ms → 1000 Hz */
+        data[EEPROM_DEFAULT_DPI_OFFSET] = 2;
+        /* 5 DPI slots: 400, 800, 1600, disabled (0), disabled (0xFFFF). */
+        for (i, raw) in [400u16, 800, 1600, 0, 0xFFFF].into_iter().enumerate() {
+            let off = EEPROM_DPI_OFFSET + i * 2;
+            data[off..off + 2].copy_from_slice(&raw.to_le_bytes());
+        }
+        /* 3 button bindings (the rest left at zero). */
+        for b in 0..3 {
+            let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
+            data[off..off + 4].copy_from_slice(&[0x80 + b as u8, b as u8, 0xAA, 0xBB]);
+        }
+        /* 2 LED records. */
+        for l in 0..EEPROM_LED_COUNT {
+            let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
+            for k in 0..EEPROM_LED_SIZE {
+                data[off + k] = (l * 16 + k) as u8;
+            }
+        }
+        /* Sentinels in unmanaged gaps and the CRC trailer. */
+        data[13] = 0x5A;
+        data[31] = 0xC3;
+        data[200] = 0x99;
+        data[254] = 0xDE;
+        data[255] = 0xAD;
+        data
+    }
+
+    #[test]
+    fn eeprom_profile_decodes_each_field() {
+        let eeprom = EepromProfile::from_bytes(&sample_sector(), 8);
+        assert_eq!(eeprom.report_interval, 1);
+        assert_eq!(eeprom.default_dpi_index, 2);
+        assert_eq!(eeprom.dpis, vec![400, 800, 1600, 0, 0xFFFF]);
+        assert_eq!(eeprom.buttons.len(), 8);
+        assert_eq!(eeprom.buttons[0], Hidpp20ButtonBinding::from_bytes(&[0x80, 0, 0xAA, 0xBB]));
+        assert_eq!(eeprom.leds.len(), EEPROM_LED_COUNT);
+        assert_eq!(eeprom.leds[1][0], 16);
+    }
+
+    #[test]
+    fn eeprom_profile_round_trips() {
+        let original = sample_sector();
+        let eeprom = EepromProfile::from_bytes(&original, 8);
+
+        /* Writing the decoded fields back onto the same buffer is a no-op. */
+        let mut rewritten = original.clone();
+        eeprom.write_into(&mut rewritten);
+        assert_eq!(rewritten, original, "read→write must not change managed bytes");
+
+        /* Writing onto a blank buffer and re-decoding yields the same record. */
+        let mut blank = vec![0u8; 256];
+        eeprom.write_into(&mut blank);
+        assert_eq!(EepromProfile::from_bytes(&blank, 8), eeprom);
+    }
+
+    #[test]
+    fn eeprom_profile_preserves_unmanaged_bytes() {
+        let mut data = sample_sector();
+        let eeprom = EepromProfile::from_bytes(&data, 8);
+        /* Scribble the managed slots with a different record's bytes, then
+         * restore: the sentinels in the gaps and CRC trailer stay put. */
+        let other = EepromProfile::default();
+        other.write_into(&mut data);
+        eeprom.write_into(&mut data);
+        assert_eq!(data[13], 0x5A);
+        assert_eq!(data[31], 0xC3);
+        assert_eq!(data[200], 0x99);
+        assert_eq!(data[254], 0xDE);
+        assert_eq!(data[255], 0xAD);
     }
 }
