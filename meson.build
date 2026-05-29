@@ -17,19 +17,16 @@ enable_systemd = dep_systemd.found()
 cargo = find_program('cargo', required: true)
 cargo_path = cargo.full_path()
 
-ratbagd_src = join_paths(project_source_root, 'ratbagd-rs')
-ratbagctl_src = join_paths(project_source_root, 'ratbagctl-rs')
-
 custom_target(
     'ratbagd',
     build_by_default: true,
     command: [
         'sh',
         '-c', '_out="$PWD/$1" && cd "'
-        + ratbagd_src
+        + project_source_root
         + '" && "'
         + cargo_path
-        + '" build --release --locked && cp target/release/ratbagd-rs "$_out"',
+        + '" build --release --bin ratbagd && cp target/release/ratbagd "$_out"',
         '_',
         '@OUTPUT@',
     ],
@@ -44,10 +41,10 @@ custom_target(
     command: [
         'sh',
         '-c', '_out="$PWD/$1" && cd "'
-        + ratbagctl_src
+        + project_source_root
         + '" && "'
         + cargo_path
-        + '" build --release --locked && cp target/release/ratbagctl "$_out"',
+        + '" build --release --bin ratbagctl && cp target/release/ratbagctl "$_out"',
         '_',
         '@OUTPUT@',
     ],
