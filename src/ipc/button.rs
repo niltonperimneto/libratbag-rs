@@ -92,7 +92,11 @@ impl RatbagButton {
     }
 
     #[zbus(property)]
-    async fn set_mapping(&self, mapping: (u32, OwnedValue)) -> zbus::Result<()> {
+    async fn set_mapping(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        mapping: (u32, OwnedValue),
+    ) -> zbus::Result<()> {
         let (action_type_raw, value) = mapping;
         let action_type = match action_type_raw {
             0 => ActionType::None,
@@ -187,29 +191,37 @@ impl RatbagButton {
             .into());
         };
 
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        let button = profile
-            .find_button_mut(self.button_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Button not found".into()))?;
-
-        button.action_type = action_type;
+        let mut mapping_value = 0;
+        let mut macro_entries = Vec::new();
         match parsed {
-            ParsedMapping::None => {
-                button.mapping_value = 0;
-                button.macro_entries.clear();
-            }
+            ParsedMapping::None => {}
             ParsedMapping::Macro(entries) => {
-                button.macro_entries = entries;
+                macro_entries = entries;
             }
             ParsedMapping::Simple(val) => {
-                button.mapping_value = val;
-                button.macro_entries.clear();
+                mapping_value = val;
             }
         }
-        profile.is_dirty = true;
+
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            let _ = info
+                .find_profile(self.profile_id)
+                .and_then(|p| p.find_button(self.button_id))
+                .ok_or_else(|| zbus::fdo::Error::Failed("Button not found".into()))?;
+
+            *info = info.with_button_mapping(
+                self.profile_id,
+                self.button_id,
+                action_type,
+                mapping_value,
+                macro_entries,
+            );
+        }
+        let _ = self.mapping_changed(&emitter).await;
         Ok(())
     }
 

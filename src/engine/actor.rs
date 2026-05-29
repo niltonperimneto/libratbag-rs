@@ -88,9 +88,7 @@ impl DeviceActor {
                     if result.is_ok() {
                         /* Clear dirty flags under a brief write-lock. */
                         let mut info = self.info.write().await;
-                        for profile in &mut info.profiles {
-                            profile.is_dirty = false;
-                        }
+                        *info = info.with_cleared_dirty_flags();
                     }
 
                     /* Process any unsolicited hardware events (e.g. profile

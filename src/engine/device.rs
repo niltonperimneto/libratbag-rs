@@ -286,6 +286,207 @@ impl DeviceInfo {
     pub fn find_profile_mut(&mut self, id: u32) -> Option<&mut ProfileInfo> {
         self.profiles.iter_mut().find(|p| p.index == id)
     }
+
+    pub fn with_resolution_disabled(&self, profile_id: u32, resolution_id: u32, disabled: bool) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(res) = profile.find_resolution_mut(resolution_id) {
+                res.is_disabled = disabled;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_resolution_dpi(&self, profile_id: u32, resolution_id: u32, dpi: Dpi) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(res) = profile.find_resolution_mut(resolution_id) {
+                res.dpi = dpi;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_active_resolution(&self, profile_id: u32, resolution_id: u32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            for res in &mut profile.resolutions {
+                res.is_active = false;
+            }
+            if let Some(res) = profile.find_resolution_mut(resolution_id) {
+                res.is_active = true;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_default_resolution(&self, profile_id: u32, resolution_id: u32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            for res in &mut profile.resolutions {
+                res.is_default = false;
+            }
+            if let Some(res) = profile.find_resolution_mut(resolution_id) {
+                res.is_default = true;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_profile_name(&self, profile_id: u32, name: String) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.name = name;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_profile_disabled(&self, profile_id: u32, disabled: bool) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.is_enabled = !disabled;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_profile_angle_snapping(&self, profile_id: u32, value: i32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.angle_snapping = value;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_profile_debounce(&self, profile_id: u32, value: i32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.debounce = value;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_profile_report_rate(&self, profile_id: u32, rate: u32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.report_rate = rate;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_active_profile(&self, profile_id: u32) -> Self {
+        let mut next = self.clone();
+        for profile in &mut next.profiles {
+            profile.is_active = false;
+        }
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            profile.is_active = true;
+            profile.is_dirty = true;
+        }
+        next
+    }
+
+    pub fn with_button_mapping(
+        &self,
+        profile_id: u32,
+        button_id: u32,
+        action_type: ActionType,
+        mapping_value: u32,
+        macro_entries: Vec<(u32, u32)>,
+    ) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(button) = profile.find_button_mut(button_id) {
+                button.action_type = action_type;
+                button.mapping_value = mapping_value;
+                button.macro_entries = macro_entries;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_mode(&self, profile_id: u32, led_id: u32, mode: LedMode) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.mode = mode;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_color(&self, profile_id: u32, led_id: u32, color: Color) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.color = color;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_secondary_color(&self, profile_id: u32, led_id: u32, color: Color) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.secondary_color = color;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_tertiary_color(&self, profile_id: u32, led_id: u32, color: Color) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.tertiary_color = color;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_effect_duration(&self, profile_id: u32, led_id: u32, duration: u32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.effect_duration = duration;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_led_brightness(&self, profile_id: u32, led_id: u32, brightness: u32) -> Self {
+        let mut next = self.clone();
+        if let Some(profile) = next.find_profile_mut(profile_id) {
+            if let Some(led) = profile.find_led_mut(led_id) {
+                led.brightness = brightness;
+                profile.is_dirty = true;
+            }
+        }
+        next
+    }
+
+    pub fn with_cleared_dirty_flags(&self) -> Self {
+        let mut next = self.clone();
+        for profile in &mut next.profiles {
+            profile.is_dirty = false;
+        }
+        next
+    }
 }
 
 /* Profile capability constants matching libratbag's `ratbag_profile_capability` enum.

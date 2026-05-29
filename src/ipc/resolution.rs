@@ -9,6 +9,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::engine::device::{DeviceInfo, Dpi, RATBAG_RESOLUTION_CAP_SEPARATE_XY_RESOLUTION};
 
 use super::fallback_owned_value;
+use super::profile::RatbagProfile;
 
 /// The `org.freedesktop.ratbag1.Resolution` interface.
 ///
@@ -58,10 +59,10 @@ impl RatbagResolution {
         /* Unwrap nested variant layers (property type is `v`, so     */
         /* clients may double-wrap: Properties.Set sends (ssv) where  */
         /* v contains v containing the actual value).                 */
-        let unwrapped: &Value<'_> = match value {
-            Value::Value(inner) => inner.as_ref(),
-            other => other,
-        };
+        let mut unwrapped = value;
+        while let Value::Value(inner) = unwrapped {
+            unwrapped = inner.as_ref();
+        }
 
         if let Some(val) = Self::extract_u32(unwrapped) {
             return Some(Dpi::Unified(val));
@@ -135,19 +136,20 @@ impl RatbagResolution {
     ) -> zbus::Result<()> {
         {
             let mut info = self.device_info.write().await;
-            let profile = info.find_profile_mut(self.profile_id).ok_or_else(|| {
+            let _ = info.find_profile(self.profile_id).ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!(
                     "Profile {} not found", self.profile_id
                 ))
             })?;
-            let res = profile.find_resolution_mut(self.resolution_id).ok_or_else(|| {
-                zbus::fdo::Error::Failed(format!(
-                    "Resolution {} not found in profile {}",
-                    self.resolution_id, self.profile_id
-                ))
-            })?;
-            res.is_disabled = disabled;
-            profile.is_dirty = true;
+            let _ = info.find_profile(self.profile_id)
+                .and_then(|p| p.find_resolution(self.resolution_id))
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed(format!(
+                        "Resolution {} not found in profile {}",
+                        self.resolution_id, self.profile_id
+                    ))
+                })?;
+            *info = info.with_resolution_disabled(self.profile_id, self.resolution_id, disabled);
         }
         let _ = self.is_disabled_changed(&emitter).await;
         Ok(())
@@ -175,7 +177,11 @@ impl RatbagResolution {
     }
 
     #[zbus(property)]
-    async fn set_resolution(&self, value: OwnedValue) -> zbus::Result<()> {
+    async fn set_resolution(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        value: OwnedValue,
+    ) -> zbus::Result<()> {
         /* Parse the incoming value before taking the write lock to minimize hold time.
          * Piper and other clients may send the DPI as a plain u32, a (u32, u32)
          * tuple, or wrapped in an extra variant layer (when the property type is `v`). */
@@ -186,30 +192,32 @@ impl RatbagResolution {
             ))
         })?;
 
-        let mut info = self.device_info.write().await;
-        let profile = info.find_profile_mut(self.profile_id).ok_or_else(|| {
-            zbus::fdo::Error::Failed(format!(
-                "Profile {} not found", self.profile_id
-            ))
-        })?;
-        let res = profile.find_resolution_mut(self.resolution_id).ok_or_else(|| {
-            zbus::fdo::Error::Failed(format!(
-                "Resolution {} not found in profile {}",
-                self.resolution_id, self.profile_id
-            ))
-        })?;
-
-        /* Reject (x, y) tuples when the device lacks the SEPARATE_XY capability. */
-        if matches!(new_dpi, Dpi::Separate { .. })
-            && !res.capabilities.contains(&RATBAG_RESOLUTION_CAP_SEPARATE_XY_RESOLUTION)
         {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                "Device does not support separate X/Y resolution".to_string(),
-            ).into());
-        }
+            let mut info = self.device_info.write().await;
+            let profile = info.find_profile(self.profile_id).ok_or_else(|| {
+                zbus::fdo::Error::Failed(format!(
+                    "Profile {} not found", self.profile_id
+                ))
+            })?;
+            let res = profile.find_resolution(self.resolution_id).ok_or_else(|| {
+                zbus::fdo::Error::Failed(format!(
+                    "Resolution {} not found in profile {}",
+                    self.resolution_id, self.profile_id
+                ))
+            })?;
 
-        res.dpi = new_dpi;
-        profile.is_dirty = true;
+            /* Reject (x, y) tuples when the device lacks the SEPARATE_XY capability. */
+            if matches!(new_dpi, Dpi::Separate { .. })
+                && !res.capabilities.contains(&RATBAG_RESOLUTION_CAP_SEPARATE_XY_RESOLUTION)
+            {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "Device does not support separate X/Y resolution".to_string(),
+                ).into());
+            }
+
+            *info = info.with_resolution_dpi(self.profile_id, self.resolution_id, new_dpi);
+        }
+        let _ = self.resolution_changed(&emitter).await;
         Ok(())
     }
 
@@ -236,23 +244,19 @@ impl RatbagResolution {
         let sibling_count;
         {
             let mut info = self.device_info.write().await;
-            let profile = info.find_profile_mut(self.profile_id).ok_or_else(|| {
+            let profile = info.find_profile(self.profile_id).ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!(
                     "Profile {} not found", self.profile_id
                 ))
             })?;
             sibling_count = profile.resolutions.len();
-            for res in &mut profile.resolutions {
-                res.is_active = false;
-            }
-            let res = profile.find_resolution_mut(self.resolution_id).ok_or_else(|| {
+            let _ = profile.find_resolution(self.resolution_id).ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!(
                     "Resolution {} not found in profile {}",
                     self.resolution_id, self.profile_id
                 ))
             })?;
-            res.is_active = true;
-            profile.is_dirty = true;
+            *info = info.with_active_resolution(self.profile_id, self.resolution_id);
         }
 
         /* Emit IsActive changed on every sibling resolution.  This mirrors */
@@ -268,6 +272,18 @@ impl RatbagResolution {
                     .is_active_changed(iface_ref.signal_emitter())
                     .await;
             }
+        }
+
+        /* Also emit IsDirty changed on the parent profile interface. */
+        let profile_path = format!("{}/p{}", self.device_path, self.profile_id);
+        if let Ok(iface_ref) =
+            server.interface::<_, RatbagProfile>(profile_path.as_str()).await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .is_dirty_changed(iface_ref.signal_emitter())
+                .await;
         }
 
         tracing::info!(
@@ -291,23 +307,19 @@ impl RatbagResolution {
         let sibling_count;
         {
             let mut info = self.device_info.write().await;
-            let profile = info.find_profile_mut(self.profile_id).ok_or_else(|| {
+            let profile = info.find_profile(self.profile_id).ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!(
                     "Profile {} not found", self.profile_id
                 ))
             })?;
             sibling_count = profile.resolutions.len();
-            for res in &mut profile.resolutions {
-                res.is_default = false;
-            }
-            let res = profile.find_resolution_mut(self.resolution_id).ok_or_else(|| {
+            let _ = profile.find_resolution(self.resolution_id).ok_or_else(|| {
                 zbus::fdo::Error::Failed(format!(
                     "Resolution {} not found in profile {}",
                     self.resolution_id, self.profile_id
                 ))
             })?;
-            res.is_default = true;
-            profile.is_dirty = true;
+            *info = info.with_default_resolution(self.profile_id, self.resolution_id);
         }
 
         /* Emit IsDefault changed on every sibling resolution.  This mirrors */
@@ -323,6 +335,18 @@ impl RatbagResolution {
                     .is_default_changed(iface_ref.signal_emitter())
                     .await;
             }
+        }
+
+        /* Also emit IsDirty changed on the parent profile interface. */
+        let profile_path = format!("{}/p{}", self.device_path, self.profile_id);
+        if let Ok(iface_ref) =
+            server.interface::<_, RatbagProfile>(profile_path.as_str()).await
+        {
+            let _ = iface_ref
+                .get()
+                .await
+                .is_dirty_changed(iface_ref.signal_emitter())
+                .await;
         }
 
         tracing::info!(

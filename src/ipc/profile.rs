@@ -85,13 +85,20 @@ impl RatbagProfile {
     }
 
     #[zbus(property)]
-    async fn set_name(&self, name: String) -> zbus::Result<()> {
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        profile.name = name;
-        profile.is_dirty = true;
+    async fn set_name(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        name: String,
+    ) -> zbus::Result<()> {
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            *info = info.with_profile_name(self.profile_id, name);
+        }
+        let _ = self.name_changed(&emitter).await;
+        let _ = self.is_dirty_changed(&emitter).await;
         Ok(())
     }
 
@@ -104,13 +111,20 @@ impl RatbagProfile {
     }
 
     #[zbus(property)]
-    async fn set_disabled(&self, disabled: bool) -> zbus::Result<()> {
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        profile.is_enabled = !disabled;
-        profile.is_dirty = true;
+    async fn set_disabled(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        disabled: bool,
+    ) -> zbus::Result<()> {
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            *info = info.with_profile_disabled(self.profile_id, disabled);
+        }
+        let _ = self.disabled_changed(&emitter).await;
+        let _ = self.is_dirty_changed(&emitter).await;
         Ok(())
     }
 
@@ -212,13 +226,20 @@ impl RatbagProfile {
     }
 
     #[zbus(property)]
-    async fn set_angle_snapping(&self, value: i32) -> zbus::Result<()> {
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        profile.angle_snapping = value;
-        profile.is_dirty = true;
+    async fn set_angle_snapping(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        value: i32,
+    ) -> zbus::Result<()> {
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            *info = info.with_profile_angle_snapping(self.profile_id, value);
+        }
+        let _ = self.angle_snapping_changed(&emitter).await;
+        let _ = self.is_dirty_changed(&emitter).await;
         Ok(())
     }
 
@@ -232,13 +253,20 @@ impl RatbagProfile {
     }
 
     #[zbus(property)]
-    async fn set_debounce(&self, value: i32) -> zbus::Result<()> {
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        profile.debounce = value;
-        profile.is_dirty = true;
+    async fn set_debounce(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        value: i32,
+    ) -> zbus::Result<()> {
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            *info = info.with_profile_debounce(self.profile_id, value);
+        }
+        let _ = self.debounce_changed(&emitter).await;
+        let _ = self.is_dirty_changed(&emitter).await;
         Ok(())
     }
 
@@ -265,16 +293,23 @@ impl RatbagProfile {
     /// The value is clamped to [125, 8000] before storage, matching the
     /// C daemon's sanity check.
     #[zbus(property)]
-    async fn set_report_rate(&self, rate: u32) -> zbus::Result<()> {
+    async fn set_report_rate(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        rate: u32,
+    ) -> zbus::Result<()> {
         /* Clamp *before* acquiring the write lock. */
         let clamped = ProfileInfo::clamp_report_rate(rate);
 
-        let mut info = self.device_info.write().await;
-        let profile = info
-            .find_profile_mut(self.profile_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-        profile.report_rate = clamped;
-        profile.is_dirty = true;
+        {
+            let mut info = self.device_info.write().await;
+            let _ = info
+                .find_profile(self.profile_id)
+                .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
+            *info = info.with_profile_report_rate(self.profile_id, clamped);
+        }
+        let _ = self.report_rate_changed(&emitter).await;
+        let _ = self.is_dirty_changed(&emitter).await;
         Ok(())
     }
 
@@ -309,14 +344,10 @@ impl RatbagProfile {
                 .iter()
                 .find(|p| p.is_active)
                 .map(|p| p.index);
-            for profile in &mut info.profiles {
-                profile.is_active = false;
-            }
-            let profile = info
-                .find_profile_mut(self.profile_id)
+            let _ = info
+                .find_profile(self.profile_id)
                 .ok_or_else(|| zbus::fdo::Error::Failed("Profile not found".into()))?;
-            profile.is_active = true;
-            profile.is_dirty = true;
+            *info = info.with_active_profile(self.profile_id);
         }
         /* Lock released — now emit PropertiesChanged signals.         */
         /*                                                              */
