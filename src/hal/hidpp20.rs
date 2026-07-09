@@ -605,7 +605,12 @@ impl Hidpp20Driver {
             if report.is_error() {
                 return None;
             }
-            if !report.matches_hidpp20(idx, ROOT_FEATURE_INDEX) {
+            if !report.matches_hidpp20_response(
+                idx,
+                ROOT_FEATURE_INDEX,
+                ROOT_FN_GET_PROTOCOL_VERSION,
+                SW_ID,
+            ) {
                 return None;
             }
             if let HidppReport::Long { params, .. } = report {
@@ -636,21 +641,29 @@ impl Hidpp20Driver {
         );
 
         let dev_idx = self.device_index;
+        let expected_fn_sw = hidpp::fn_sw(ROOT_FN_GET_FEATURE, SW_ID);
         let index = io
             .request(&request, 20, 3, move |buf| {
                 let report = HidppReport::parse(buf)?;
 
                 /* An error from the Root feature means the page is not supported. */
                 if report
-                    .hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX)
+                    .hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX, expected_fn_sw)
                     .is_some()
-                    || report.is_error()
                 {
                     return Some(None);
                 }
 
-                /* Accept both Long and Short responses for the Root feature. */
-                if !report.matches_hidpp20(dev_idx, ROOT_FEATURE_INDEX) {
+                /* Accept both Long and Short responses for the Root feature,
+                 * but only when the echoed fn<<4|sw_id byte matches our
+                 * request — anything else is a notification or a stale
+                 * response and must not be mistaken for the lookup result. */
+                if !report.matches_hidpp20_response(
+                    dev_idx,
+                    ROOT_FEATURE_INDEX,
+                    ROOT_FN_GET_FEATURE,
+                    SW_ID,
+                ) {
                     return None;
                 }
                 let index = match &report {
@@ -688,44 +701,37 @@ impl Hidpp20Driver {
         }
 
         let dev_idx = self.device_index;
+        let expected_fn_sw = hidpp::fn_sw(function, SW_ID);
         let resp = io
             .request(&request, 20, 3, move |buf| {
                 let report = HidppReport::parse(buf)?;
 
                 /* 1. Check for HID++ error (Long 0xFF or Short 0x8F). */
-                if let Some(code) = report.hidpp20_error_code(dev_idx, feature_index) {
+                if let Some(code) =
+                    report.hidpp20_error_code(dev_idx, feature_index, expected_fn_sw)
+                {
                     return Some(Resp::HidppErr(code));
                 }
 
-                /* 2. Successful Long response. */
-                if let HidppReport::Long {
-                    device_index,
-                    sub_id,
-                    params,
-                    ..
-                } = &report
-                {
-                    if *device_index == dev_idx && *sub_id == feature_index {
-                        return Some(Resp::Ok(*params));
-                    }
+                /* 2. Successful response: device index, feature index AND
+                 * the echoed fn<<4|sw_id byte must all match.  Unsolicited
+                 * notifications from the same feature (sw_id 0) fall
+                 * through to pending_events instead of being mistaken for
+                 * our response — this was corrupting memRead chains.      */
+                if !report.matches_hidpp20_response(dev_idx, feature_index, function, SW_ID) {
+                    return None;
                 }
 
-                /* 3. Successful Short response (SET acknowledgment). */
-                if let HidppReport::Short {
-                    device_index,
-                    sub_id,
-                    params,
-                    ..
-                } = &report
-                {
-                    if *device_index == dev_idx && *sub_id == feature_index {
+                match &report {
+                    HidppReport::Long { params, .. } => Some(Resp::Ok(*params)),
+                    /* Short responses (SET acknowledgments on wireless
+                     * devices) are zero-padded to 16 bytes. */
+                    HidppReport::Short { params, .. } => {
                         let mut long_params = [0u8; 16];
                         long_params[..3].copy_from_slice(params);
-                        return Some(Resp::Ok(long_params));
+                        Some(Resp::Ok(long_params))
                     }
                 }
-
-                None
             })
             .await?;
 
@@ -795,24 +801,21 @@ impl Hidpp20Driver {
         }
 
         let dev_idx = self.device_index;
+        let expected_fn_sw = hidpp::fn_sw(function, SW_ID);
         let resp = io
             .request(&request, 20, 3, move |buf| {
                 let report = HidppReport::parse(buf)?;
 
                 if let Some(code) =
-                    report.hidpp20_error_code(dev_idx, feature_index)
+                    report.hidpp20_error_code(dev_idx, feature_index, expected_fn_sw)
                 {
                     return Some(Resp::HidppErr(code));
                 }
 
-                match &report {
-                    HidppReport::Long { device_index, sub_id, .. }
-                    | HidppReport::Short { device_index, sub_id, .. }
-                        if *device_index == dev_idx && *sub_id == feature_index =>
-                    {
-                        Some(Resp::Ok)
-                    }
-                    _ => None,
+                if report.matches_hidpp20_response(dev_idx, feature_index, function, SW_ID) {
+                    Some(Resp::Ok)
+                } else {
+                    None
                 }
             })
             .await?;

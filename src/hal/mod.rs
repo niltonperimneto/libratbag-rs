@@ -75,6 +75,25 @@ pub enum DriverError {
     Hidpp20ProbeFailure { indices: Vec<u8> },
 }
 
+/* HID++ 2.0 error code 0x08: the device is temporarily busy. */
+pub const HIDPP20_ERR_BUSY: u8 = 0x08;
+
+/* True when the error chain indicates a transient condition worth
+ * retrying soon (hardware timeout or device-busy), as opposed to a
+ * definitive protocol answer such as INVALID_FEATURE_INDEX. */
+pub fn is_transient_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<DriverError>(),
+            Some(DriverError::Timeout { .. })
+                | Some(DriverError::Hidpp20Error {
+                    error_code: HIDPP20_ERR_BUSY,
+                    ..
+                })
+        )
+    })
+}
+
 /* Maximum HID report size.                                        */
 /*                                                                 */
 /* Roccat macros are the largest at 2082 bytes. We use 4096 as    */

@@ -55,6 +55,15 @@ pub const ROOT_FEATURE_INDEX: u8 = 0x00;
 pub const ROOT_FN_GET_FEATURE: u8 = 0x00;
 pub const ROOT_FN_GET_PROTOCOL_VERSION: u8 = 0x01;
 
+/* Encode byte[3] of a HID++ 2.0 request/response: `(function << 4) | sw_id`. */
+/*                                                                            */
+/* Every response echoes this byte verbatim; unsolicited notifications carry  */
+/* sw_id = 0 in the low nibble, which is how they are told apart from         */
+/* command responses.                                                         */
+pub fn fn_sw(function: u8, sw_id: u8) -> u8 {
+    (function << 4) | (sw_id & 0x0F)
+}
+
 /* -------------------------------------------------------------------------- */
 /* LED protocol constants (from C library hidpp20.h)                          */
 /* -------------------------------------------------------------------------- */
@@ -216,14 +225,38 @@ impl HidppReport {
         }
     }
 
-    /* For a HID++ 2.0 long report, returns true if it is a response */
-    /* matching the given device index and feature index. */
-    pub fn matches_hidpp20(&self, expected_dev: u8, expected_feature: u8) -> bool {
-        matches!(
-            self,
-            Self::Long { device_index, sub_id, .. }
-                if *device_index == expected_dev && *sub_id == expected_feature
-        )
+    /* True only for a SUCCESS response to our exact command: device     */
+    /* index, feature index (sub_id), AND the echoed fn<<4|sw_id byte    */
+    /* must all match.  Unsolicited notifications from the same feature  */
+    /* carry sw_id = 0 in the low nibble and are rejected here, which    */
+    /* keeps them from being mistaken for command responses (they are    */
+    /* buffered as pending events instead and reach handle_event).       */
+    pub fn matches_hidpp20_response(
+        &self,
+        expected_dev: u8,
+        expected_feature: u8,
+        function: u8,
+        sw_id: u8,
+    ) -> bool {
+        let expected_addr = fn_sw(function, sw_id);
+        match self {
+            Self::Long {
+                device_index,
+                sub_id,
+                address,
+                ..
+            }
+            | Self::Short {
+                device_index,
+                sub_id,
+                address,
+                ..
+            } => {
+                *device_index == expected_dev
+                    && *sub_id == expected_feature
+                    && *address == expected_addr
+            }
+        }
     }
 
     /* Check if this report is a HID++ 2.0 error for the given device          */
@@ -234,10 +267,15 @@ impl HidppReport {
     /* - Short (0x10): [dev, 0x8F, feature_idx, (fn<<4|sw), error_code, 0]      */
     /*   The short variant is used by receivers when the wireless device is      */
     /*   unreachable or the request is invalid.                                 */
+    /*                                                                          */
+    /* `expected_fn_sw` is the echoed request byte[3]; the check is tolerant    */
+    /* of firmware that zeroes the echo field (params[0] == 0 also matches),    */
+    /* so a real error is never misclassified as a timeout.                     */
     pub fn hidpp20_error_code(
         &self,
         expected_dev: u8,
         expected_feature: u8,
+        expected_fn_sw: u8,
     ) -> Option<u8> {
         match self {
             Self::Long {
@@ -247,7 +285,8 @@ impl HidppReport {
                 params,
             } if *device_index == expected_dev
                 && *sub_id == HIDPP20_ERROR
-                && *address == expected_feature =>
+                && *address == expected_feature
+                && (params[0] == expected_fn_sw || params[0] == 0) =>
             {
                 Some(params[1])
             }
@@ -258,7 +297,8 @@ impl HidppReport {
                 params,
             } if *device_index == expected_dev
                 && *sub_id == HIDPP10_ERROR
-                && *address == expected_feature =>
+                && *address == expected_feature
+                && (params[0] == expected_fn_sw || params[0] == 0) =>
             {
                 Some(params[1])
             }
@@ -469,16 +509,74 @@ mod tests {
     }
 
     #[test]
-    fn matches_hidpp20_helper() {
+    fn fn_sw_encoding() {
+        assert_eq!(fn_sw(0x01, 0x04), 0x14);
+        assert_eq!(fn_sw(0x0E, 0x04), 0xE4);
+        /* sw_id is masked to its nibble */
+        assert_eq!(fn_sw(0x02, 0xFF), 0x2F);
+    }
+
+    #[test]
+    fn matches_hidpp20_response_helper() {
+        /* Response to function 0x01 issued with sw_id 0x04 → address 0x14. */
         let report = HidppReport::Long {
+            device_index: 0x00,
+            sub_id: 0x05,
+            address: 0x14,
+            params: [0; 16],
+        };
+        assert!(report.matches_hidpp20_response(0x00, 0x05, 0x01, 0x04));
+        /* Wrong feature index or device index. */
+        assert!(!report.matches_hidpp20_response(0x00, 0x06, 0x01, 0x04));
+        assert!(!report.matches_hidpp20_response(0x01, 0x05, 0x01, 0x04));
+        /* Wrong function nibble. */
+        assert!(!report.matches_hidpp20_response(0x00, 0x05, 0x02, 0x04));
+
+        /* An unsolicited notification carries sw_id 0 in the low nibble
+         * (address 0x10 here) and must NOT match a command response. */
+        let notification = HidppReport::Long {
             device_index: 0x00,
             sub_id: 0x05,
             address: 0x10,
             params: [0; 16],
         };
-        assert!(report.matches_hidpp20(0x00, 0x05));
-        assert!(!report.matches_hidpp20(0x00, 0x06));
-        assert!(!report.matches_hidpp20(0x01, 0x05));
+        assert!(!notification.matches_hidpp20_response(0x00, 0x05, 0x01, 0x04));
+
+        /* Short responses (SET acknowledgments) match too. */
+        let short = HidppReport::Short {
+            device_index: 0x00,
+            sub_id: 0x05,
+            address: 0x14,
+            params: [0; 3],
+        };
+        assert!(short.matches_hidpp20_response(0x00, 0x05, 0x01, 0x04));
+    }
+
+    #[test]
+    fn hidpp20_error_code_validates_fn_sw_echo() {
+        let mut params = [0u8; 16];
+        params[0] = 0x14; /* echoed fn<<4|sw */
+        params[1] = 0x08; /* BUSY */
+        let err = HidppReport::Long {
+            device_index: 0x00,
+            sub_id: HIDPP20_ERROR,
+            address: 0x05,
+            params,
+        };
+        assert_eq!(err.hidpp20_error_code(0x00, 0x05, 0x14), Some(0x08));
+        /* Mismatched echo → not our error. */
+        assert_eq!(err.hidpp20_error_code(0x00, 0x05, 0x24), None);
+
+        /* Firmware that zeroes the echo field still matches (tolerant). */
+        let mut zeroed = params;
+        zeroed[0] = 0x00;
+        let err_zeroed = HidppReport::Long {
+            device_index: 0x00,
+            sub_id: HIDPP20_ERROR,
+            address: 0x05,
+            params: zeroed,
+        };
+        assert_eq!(err_zeroed.hidpp20_error_code(0x00, 0x05, 0x14), Some(0x08));
     }
 
     /* ------------------------------------------------------------------ */
