@@ -1487,6 +1487,12 @@ impl super::DeviceDriver for Hidpp20Driver {
         "Logitech HID++ 2.0"
     }
 
+    /* Profile/DPI switches via physical buttons arrive as unsolicited
+     * 0x8100 notifications; watch for them while idle. */
+    fn wants_unsolicited_events(&self) -> bool {
+        true
+    }
+
     async fn probe(&mut self, io: &mut DeviceIo) -> Result<()> {
         /* Try the corded device index first, then the wireless receiver index.
          *

@@ -416,7 +416,10 @@ async fn probe_and_register(
             entry,
         )));
 
-        match actor::spawn_device_actor(&dev.devnode, drv, Arc::clone(&attempt_info)).await {
+        /* No change-notification consumer yet: shared DeviceInfo keeps
+         * D-Bus property reads live without extra signalling. */
+        match actor::spawn_device_actor(&dev.devnode, drv, Arc::clone(&attempt_info), None).await
+        {
             Ok(handle) => {
                 if attempt > 1 {
                     info!(

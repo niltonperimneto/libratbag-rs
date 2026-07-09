@@ -55,16 +55,39 @@ impl ActorHandle {
     }
 }
 
+/* Upper bound on reports drained per idle wakeup, so a flood of input
+ * reports cannot starve pending actor messages. */
+const MAX_IDLE_DRAIN: usize = 32;
+
+/* What woke the actor loop up. */
+enum Wakeup {
+    Message(Option<ActorMessage>),
+    IdleReadable(std::io::Result<()>),
+}
+
 /* The device actor itself. Owns the I/O handle and driver instance. */
 struct DeviceActor {
     driver: Box<dyn DeviceDriver>,
     io: DeviceIo,
     info: Arc<RwLock<DeviceInfo>>,
     rx: mpsc::Receiver<ActorMessage>,
+    /* Fired (best-effort) whenever an unsolicited hardware event changed
+     * the shared device state, so a future consumer can emit D-Bus
+     * signals.  `None` disables notification. */
+    notify_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl DeviceActor {
-    /* Main actor loop: process messages until shutdown or channel close. */
+    /* Main actor loop: process messages until shutdown or channel close.
+     *
+     * When the driver opts in via `wants_unsolicited_events()`, the loop
+     * also watches the device fd between commands and feeds unsolicited
+     * reports (profile/DPI switches from physical buttons) to
+     * `DeviceDriver::handle_event` — previously these were only seen
+     * after a commit happened to run.  `biased` keeps command handling
+     * ahead of event draining, and the readiness future is only polled
+     * between commands, so it can never interleave with an in-flight
+     * `request()` during a commit. */
     async fn run(mut self) {
         info!(
             "Device actor started for {} (driver: {})",
@@ -72,62 +95,140 @@ impl DeviceActor {
             self.driver.name()
         );
 
-        while let Some(msg) = self.rx.recv().await {
-            match msg {
-                ActorMessage::Commit { reply } => {
-                    /* Clone a snapshot of the device state and release the
-                     * lock immediately.  This prevents write-starvation:
-                     * if the commit takes a long time (wireless retries,
-                     * EEPROM writes), concurrent DBus writers are not
-                     * blocked waiting for the read-lock to be released.
-                     * The ~1.6 µs clone cost is negligible compared to the
-                     * multi-millisecond hardware I/O that follows. */
-                    let snapshot = self.info.read().await.clone();
-                    let result = self.driver.commit(&mut self.io, &snapshot).await;
+        let mut watch_idle = self.driver.wants_unsolicited_events();
 
-                    if result.is_ok() {
-                        /* Clear dirty flags under a brief write-lock. */
-                        let mut info = self.info.write().await;
-                        *info = info.with_cleared_dirty_flags();
-                    }
-
-                    /* Process any unsolicited hardware events (e.g. profile
-                     * switch notifications) that arrived during the commit's
-                     * I/O calls.  These were buffered by DeviceIo::request()
-                     * because they didn't match the pending command. */
-                    let events = self.io.drain_events();
-                    if !events.is_empty() {
-                        let mut info = self.info.write().await;
-                        for event in &events {
-                            match self.driver.handle_event(event, &mut info).await {
-                                Ok(true) => {
-                                    debug!(
-                                        "Unsolicited event updated device state: {:02x?}",
-                                        event
-                                    );
-                                }
-                                Ok(false) => { /* event was recognised but no state change */ }
-                                Err(e) => {
-                                    warn!("Error handling unsolicited event: {e}");
-                                }
-                            }
-                        }
-                    }
-
-                    let response = result.map_err(|e| format!("{e:#}"));
-                    let _ = reply.send(response);
+        loop {
+            /* Both arms are cancel-safe: `mpsc::recv` and the readiness
+             * wait consume nothing when their future is dropped. */
+            let wakeup = tokio::select! {
+                biased;
+                msg = self.rx.recv() => Wakeup::Message(msg),
+                result = self.io.wait_readable(), if watch_idle => {
+                    Wakeup::IdleReadable(result)
                 }
-                ActorMessage::Shutdown => {
+            };
+
+            match wakeup {
+                Wakeup::Message(Some(ActorMessage::Commit { reply })) => {
+                    self.handle_commit(reply).await;
+                }
+                Wakeup::Message(Some(ActorMessage::Shutdown)) => {
                     info!(
                         "Device actor shutting down for {}",
                         self.info.read().await.sysname
                     );
                     break;
                 }
+                Wakeup::Message(None) => break,
+                Wakeup::IdleReadable(Ok(())) => {
+                    self.process_unsolicited().await;
+                }
+                Wakeup::IdleReadable(Err(e)) => {
+                    /* ENODEV after unplug and similar: stop watching
+                     * instead of spinning; the udev Remove → Shutdown
+                     * message ends the loop shortly. */
+                    warn!(
+                        "Idle watch failed on {}: {e}; disabling idle event listener",
+                        self.io.path().display()
+                    );
+                    watch_idle = false;
+                }
             }
         }
 
         debug!("Device actor loop exited");
+    }
+
+    /* Commit pending changes to hardware and reply to the requester. */
+    async fn handle_commit(&mut self, reply: oneshot::Sender<Result<(), String>>) {
+        /* Clone a snapshot of the device state and release the
+         * lock immediately.  This prevents write-starvation:
+         * if the commit takes a long time (wireless retries,
+         * EEPROM writes), concurrent DBus writers are not
+         * blocked waiting for the read-lock to be released.
+         * The ~1.6 µs clone cost is negligible compared to the
+         * multi-millisecond hardware I/O that follows. */
+        let snapshot = self.info.read().await.clone();
+        let result = self.driver.commit(&mut self.io, &snapshot).await;
+
+        if result.is_ok() {
+            /* Clear dirty flags under a brief write-lock. */
+            let mut info = self.info.write().await;
+            *info = info.with_cleared_dirty_flags();
+        }
+
+        /* Process any unsolicited hardware events (e.g. profile
+         * switch notifications) that arrived during the commit's
+         * I/O calls.  These were buffered by DeviceIo::request()
+         * because they didn't match the pending command. */
+        let events = self.io.drain_events();
+        self.handle_unsolicited_reports(events).await;
+
+        let response = result.map_err(|e| format!("{e:#}"));
+        let _ = reply.send(response);
+    }
+
+    /* Drain reports queued on the idle fd and feed the HID++ ones to
+     * the driver.  Never blocks: uses the non-blocking read so command
+     * messages regain control as soon as the queue is empty. */
+    async fn process_unsolicited(&mut self) {
+        let mut buf = [0u8; 64];
+        let mut reports: Vec<Vec<u8>> = Vec::new();
+
+        for _ in 0..MAX_IDLE_DRAIN {
+            match self.io.try_read_report(&mut buf) {
+                Ok(Some(n))
+                    if n > 0
+                        && (buf[0] == crate::hal::HIDPP_SHORT_REPORT_ID
+                            || buf[0] == crate::hal::HIDPP_LONG_REPORT_ID) =>
+                {
+                    reports.push(buf[..n].to_vec());
+                }
+                /* Non-HID++ noise (motion/keyboard input): discard. */
+                Ok(Some(_)) => continue,
+                /* Queue drained. */
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Idle read failed on {}: {e:#}", self.io.path().display());
+                    break;
+                }
+            }
+        }
+
+        /* Include anything buffered by earlier request() calls. */
+        reports.extend(self.io.drain_events());
+        self.handle_unsolicited_reports(reports).await;
+    }
+
+    /* Feed unsolicited reports to the driver under a single write-lock
+     * and fire the change notification if any of them altered state. */
+    async fn handle_unsolicited_reports(&mut self, reports: Vec<Vec<u8>>) {
+        if reports.is_empty() {
+            return;
+        }
+
+        let mut changed = false;
+        {
+            let mut info = self.info.write().await;
+            for report in &reports {
+                match self.driver.handle_event(report, &mut info).await {
+                    Ok(true) => {
+                        changed = true;
+                        debug!("Unsolicited event updated device state: {:02x?}", report);
+                    }
+                    Ok(false) => { /* recognised but no state change */ }
+                    Err(e) => {
+                        warn!("Error handling unsolicited event: {e}");
+                    }
+                }
+            }
+        }
+
+        if changed
+            && let Some(tx) = &self.notify_tx
+        {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -153,11 +254,18 @@ const LOAD_PROFILES_TIMEOUT: Duration = Duration::from_secs(15);
  * 3. Reads the full device state (profiles, DPIs, LEDs).
  * 4. Spawns the actor task and returns a handle for DBus objects.
  *
- * Returns `Err` if probing or profile loading fails or times out. */
+ * Returns `Err` if probing or profile loading fails or times out.
+ *
+ * `notify_tx`, when provided, is fired every time an unsolicited
+ * hardware event changes the shared device state (e.g. the user
+ * switches profiles with a physical button), so the D-Bus layer can
+ * emit change signals.  Pass `None` when no signalling is needed —
+ * the shared `DeviceInfo` is updated either way. */
 pub async fn spawn_device_actor(
     devnode: &Path,
     mut driver: Box<dyn DeviceDriver>,
     info: Arc<RwLock<DeviceInfo>>,
+    notify_tx: Option<mpsc::UnboundedSender<()>>,
 ) -> Result<ActorHandle> {
     let mut io = DeviceIo::open(devnode)
         .await
@@ -216,6 +324,7 @@ pub async fn spawn_device_actor(
         io,
         info,
         rx,
+        notify_tx,
     };
 
     tokio::spawn(async move {

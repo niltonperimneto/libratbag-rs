@@ -2032,6 +2032,10 @@ impl super::DeviceDriver for Hidpp10Driver {
         "Logitech HID++ 1.0"
     }
 
+    /* NOTE: flip wants_unsolicited_events() to true once this driver
+     * implements handle_event(); until then the default (false) avoids
+     * idle wakeups that would only discard the notifications. */
+
     async fn probe(&mut self, io: &mut DeviceIo) -> Result<()> {
         const PROBE_INDICES: &[u8] = &[DEVICE_IDX_RECEIVER, DEVICE_IDX_CORDED];
         for &idx in PROBE_INDICES {

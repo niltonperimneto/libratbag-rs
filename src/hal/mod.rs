@@ -130,9 +130,10 @@ const MAX_PENDING_EVENTS: usize = 64;
 
 /* HID++ report ID prefixes. Any report whose first byte is NOT   */
 /* one of these is a regular HID input report (mouse movement,    */
-/* keyboard, etc.) and should be silently skipped.                */
-const HIDPP_SHORT_REPORT_ID: u8 = 0x10;
-const HIDPP_LONG_REPORT_ID: u8 = 0x11;
+/* keyboard, etc.) and should be silently skipped.  Shared with    */
+/* the device actor's idle event drain.                           */
+pub(crate) const HIDPP_SHORT_REPORT_ID: u8 = 0x10;
+pub(crate) const HIDPP_LONG_REPORT_ID: u8 = 0x11;
 
 /* Compute the `HIDIOCGFEATURE(len)` ioctl request number.        */
 /*                                                                */
@@ -699,6 +700,17 @@ pub(crate) mod mock {
 pub trait DeviceDriver: Send + Sync {
     /* Returns the driver name for logging purposes. */
     fn name(&self) -> &str;
+
+    /* Whether the actor should watch the idle fd for unsolicited       */
+    /* hardware events and feed them to `handle_event`.                 */
+    /*                                                                  */
+    /* Only meaningful for drivers that implement `handle_event`;       */
+    /* leaving it false avoids a wakeup-per-input-report loop for       */
+    /* drivers whose hidraw node carries motion reports but which have  */
+    /* no event handling.                                               */
+    fn wants_unsolicited_events(&self) -> bool {
+        false
+    }
 
     /* Probe the device to confirm it speaks this protocol.        */
     /*                                                             */
