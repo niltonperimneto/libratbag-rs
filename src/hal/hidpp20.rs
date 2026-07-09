@@ -482,6 +482,38 @@ fn hidpp20_special_to_raw(special: u32) -> u8 {
     }
 }
 
+/* Decide how many button objects to expose, in priority order:
+ *
+ *   1. the onboard-profiles descriptor's button_count,
+ *   2. the 0x1b04 Special Keys/Buttons control count,
+ *   3. the `.device` database entry's button count.
+ *
+ * A transient 0x1b04 failure (timeout/BUSY) propagates as `Err` so the
+ * device load aborts and the probe retries — NEVER fall through to a
+ * smaller source on a transient error, and never return 0: registering
+ * a mouse with zero button objects (which also wipes the DB-seeded
+ * buttons via resize) was the "buttons randomly missing" bug. */
+fn resolve_button_count(
+    descriptor_count: usize,
+    special_keys_count: Result<usize>,
+    db_count: usize,
+) -> Result<usize> {
+    if descriptor_count > 0 {
+        return Ok(descriptor_count);
+    }
+    let from_1b04 = special_keys_count?;
+    if from_1b04 > 0 {
+        return Ok(from_1b04);
+    }
+    if db_count > 0 {
+        return Ok(db_count);
+    }
+    anyhow::bail!(
+        "no button count available (descriptor=0, 0x1b04=0, device-db=0); \
+         aborting load so the probe can retry"
+    )
+}
+
 /* Parse HID++ 2.0 DPI sensor list entries (big-endian u16 pairs).
  *
  * The `list_bytes` slice starts immediately after the sensorIndex byte
@@ -789,10 +821,14 @@ impl Hidpp20Driver {
      * not provide a usable button_count (e.g. the G305, whose EEPROM may be
      * uninitialised, or any host-managed device without 0x8100).
      *
-     * Returns 0 when the feature is absent or the request fails. */
-    async fn query_special_keys_count(&self, io: &mut DeviceIo) -> usize {
+     * Returns `Ok(0)` only for DEFINITIVE answers (feature absent, or the
+     * device rejected the request).  Transient failures — a timeout or a
+     * BUSY reply on a freshly-woken wireless link — propagate as `Err` so
+     * the caller can abort the load and let the probe retry, instead of
+     * silently registering the device with zero buttons. */
+    async fn query_special_keys_count(&self, io: &mut DeviceIo) -> Result<usize> {
         let Some(idx) = self.features.special_keys else {
-            return 0;
+            return Ok(0);
         };
         match self
             .feature_request(io, idx, SPECIAL_KEYS_FN_GET_COUNT, &[])
@@ -801,11 +837,14 @@ impl Hidpp20Driver {
             Ok(resp) => {
                 let count = resp[0] as usize;
                 info!("HID++ 2.0: special keys/buttons (0x1b04) reports {count} controls");
-                count
+                Ok(count)
+            }
+            Err(e) if crate::hal::is_transient_error(&e) => {
+                Err(e).context("transient failure querying 0x1b04 control count")
             }
             Err(e) => {
-                debug!("HID++ 2.0: failed to query special keys count: {e}");
-                0
+                debug!("HID++ 2.0: 0x1b04 getCount rejected by device: {e:#}");
+                Ok(0)
             }
         }
     }
@@ -1527,18 +1566,28 @@ impl super::DeviceDriver for Hidpp20Driver {
             /* The onboard descriptor's button_count is the primary source, but
              * some firmware (notably the G305 with uninitialised EEPROM) reports
              * 0 here even though the device has remappable buttons.  Fall back to
-             * the Special Keys/Buttons feature (0x1b04) count so the button
-             * objects still get exposed on D-Bus. */
-            let mut button_count = desc.button_count as usize;
-            if button_count == 0 {
-                let special_keys_count = self.query_special_keys_count(io).await;
-                if special_keys_count > 0 {
-                    info!(
-                        "HID++ 2.0: onboard descriptor button_count=0; \
-                         using 0x1b04 control count {special_keys_count} instead"
-                    );
-                    button_count = special_keys_count;
-                }
+             * the Special Keys/Buttons feature (0x1b04) count, then to the
+             * `.device` DB count, so the button objects still get exposed on
+             * D-Bus.  Capture the DB count BEFORE the resize below wipes it. */
+            let db_button_count = info
+                .profiles
+                .first()
+                .map(|p| p.buttons.len())
+                .unwrap_or(0);
+            let descriptor_count = desc.button_count as usize;
+            let special_keys_count = if descriptor_count == 0 {
+                self.query_special_keys_count(io).await
+            } else {
+                Ok(0)
+            };
+            let button_count =
+                resolve_button_count(descriptor_count, special_keys_count, db_button_count)?;
+            if descriptor_count == 0 {
+                info!(
+                    "HID++ 2.0: onboard descriptor button_count=0; \
+                     resolved {button_count} buttons from fallbacks \
+                     (db count {db_button_count})"
+                );
             }
 
             info!(
@@ -1852,8 +1901,13 @@ impl super::DeviceDriver for Hidpp20Driver {
 
             /* Without onboard profiles there is no descriptor button_count, so
              * enumerate buttons from the Special Keys/Buttons feature (0x1b04).
-             * Size each profile's button list to match the hardware controls. */
-            let button_count = self.query_special_keys_count(io).await;
+             * Size each profile's button list to match the hardware controls.
+             * A transient query failure aborts the load (the probe retries);
+             * a definitive 0 keeps the `.device`-DB-seeded buttons as-is. */
+            let button_count = self
+                .query_special_keys_count(io)
+                .await
+                .context("querying 0x1b04 button count for host-managed device")?;
             if button_count > 0 {
                 for p in &mut info.profiles {
                     p.buttons
@@ -2492,6 +2546,41 @@ mod tests {
             "probe should fail fast, took {elapsed:?}"
         );
         drop(responder);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Button count resolution                                            */
+    /* ------------------------------------------------------------------ */
+
+    fn transient_err() -> anyhow::Error {
+        crate::hal::DriverError::Timeout { attempts: 3 }.into()
+    }
+
+    #[test]
+    fn button_count_descriptor_wins() {
+        assert_eq!(resolve_button_count(8, Ok(11), 5).unwrap(), 8);
+        /* Even a transient 0x1b04 error is irrelevant when the descriptor
+         * provided a count (the query is skipped in practice). */
+        assert_eq!(resolve_button_count(8, Err(transient_err()), 5).unwrap(), 8);
+    }
+
+    #[test]
+    fn button_count_falls_back_to_1b04_then_db() {
+        assert_eq!(resolve_button_count(0, Ok(11), 5).unwrap(), 11);
+        assert_eq!(resolve_button_count(0, Ok(0), 5).unwrap(), 5);
+    }
+
+    #[test]
+    fn button_count_transient_error_propagates() {
+        /* A timeout must NOT silently degrade to the DB count (the device
+         * may support more buttons than the DB knows about) and must never
+         * produce 0. */
+        assert!(resolve_button_count(0, Err(transient_err()), 5).is_err());
+    }
+
+    #[test]
+    fn button_count_never_zero() {
+        assert!(resolve_button_count(0, Ok(0), 0).is_err());
     }
 
     /* Build a 256-byte sector with recognisable values at every managed
