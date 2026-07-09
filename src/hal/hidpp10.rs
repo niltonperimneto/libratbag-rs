@@ -815,6 +815,18 @@ pub struct Hidpp10Driver {
     profile_count: usize,
 }
 
+/* Outcome of a protocol probe at one device index. */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hidpp10ProbeResult {
+    /* The device answered the notifications-register read. */
+    Params([u8; 3]),
+    /* The receiver reported RESOURCE_ERROR: a device is paired at this
+     * index but currently asleep or powered off. */
+    Asleep,
+    /* Timeout or a definitive error — no HID++ 1.0 device at this index. */
+    NoResponse,
+}
+
 impl Hidpp10Driver {
     pub fn new() -> Self {
         Self {
@@ -830,26 +842,46 @@ impl Hidpp10Driver {
 
     /* ---- Register I/O primitives --------------------------------- */
 
+    /* Probe one device index.  Error replies fail fast instead of
+     * burning the read deadline: RESOURCE_ERROR means the paired device
+     * is asleep/powered off (the caller parks the device for a
+     * wake-triggered re-probe); any other 0x8F error means no HID++ 1.0
+     * device answers at this index. */
     async fn try_probe_index(
         &self,
         io: &mut DeviceIo,
         idx: u8,
-    ) -> Option<[u8; 3]> {
+    ) -> Hidpp10ProbeResult {
         let request = hidpp::build_short_report(
             idx, SUB_ID_GET_REGISTER, REG_HIDPP_NOTIFICATIONS,
             [0x00, 0x00, 0x00],
         );
         io.request(&request, 20, 2, move |buf| {
             let report = HidppReport::parse(buf)?;
+            /* HID++ 1.0 error layout: [0x10, dev, 0x8F, orig_sub_id,
+             * orig_address, err_code, 0] → parsed Short with
+             * address = orig_sub_id, params = [orig_address, err_code, 0]. */
+            if let HidppReport::Short { device_index, sub_id, address, params } = &report
+                && *device_index == idx
+                && *sub_id == hidpp::HIDPP10_ERROR
+                && *address == SUB_ID_GET_REGISTER
+                && params[0] == REG_HIDPP_NOTIFICATIONS
+            {
+                if params[1] == hidpp::HIDPP10_ERR_RESOURCE_ERROR {
+                    return Some(Hidpp10ProbeResult::Asleep);
+                }
+                return Some(Hidpp10ProbeResult::NoResponse);
+            }
             if report.is_error() { return None; }
             match report {
                 HidppReport::Short { device_index, sub_id, address, params }
                     if device_index == idx
                         && sub_id == SUB_ID_GET_REGISTER
-                        && address == REG_HIDPP_NOTIFICATIONS => Some(params),
+                        && address == REG_HIDPP_NOTIFICATIONS =>
+                    Some(Hidpp10ProbeResult::Params(params)),
                 _ => None,
             }
-        }).await.ok()
+        }).await.unwrap_or(Hidpp10ProbeResult::NoResponse)
     }
 
     async fn short_register_request(
@@ -2003,19 +2035,30 @@ impl super::DeviceDriver for Hidpp10Driver {
     async fn probe(&mut self, io: &mut DeviceIo) -> Result<()> {
         const PROBE_INDICES: &[u8] = &[DEVICE_IDX_RECEIVER, DEVICE_IDX_CORDED];
         for &idx in PROBE_INDICES {
-            if let Some(params) = self.try_probe_index(io, idx).await {
-                self.device_index = idx;
-                self.version = ProtocolVersion {
-                    major: params[0],
-                    minor: params[1],
-                };
-                info!(
-                    "HID++ 1.0 device detected at index 0x{idx:02X} (protocol {}.{})",
-                    self.version.major, self.version.minor
-                );
-                return Ok(());
+            match self.try_probe_index(io, idx).await {
+                Hidpp10ProbeResult::Params(params) => {
+                    self.device_index = idx;
+                    self.version = ProtocolVersion {
+                        major: params[0],
+                        minor: params[1],
+                    };
+                    info!(
+                        "HID++ 1.0 device detected at index 0x{idx:02X} (protocol {}.{})",
+                        self.version.major, self.version.minor
+                    );
+                    return Ok(());
+                }
+                Hidpp10ProbeResult::Asleep => {
+                    info!(
+                        "HID++ 1.0: device at index 0x{idx:02X} is paired but \
+                         unreachable (asleep or powered off)"
+                    );
+                    return Err(crate::hal::DriverError::DeviceAsleep.into());
+                }
+                Hidpp10ProbeResult::NoResponse => {
+                    debug!("HID++ 1.0 probe at index 0x{idx:02X}: no response");
+                }
             }
-            debug!("HID++ 1.0 probe at index 0x{idx:02X}: no response");
         }
         anyhow::bail!(
             "HID++ 1.0 protocol version probe failed (tried indices: {:02X?})",

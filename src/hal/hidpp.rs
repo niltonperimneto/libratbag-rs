@@ -12,6 +12,16 @@ pub const REPORT_ID_LONG: u8 = 0x11;
 pub const HIDPP10_ERROR: u8 = 0x8F;
 pub const HIDPP20_ERROR: u8 = 0xFF;
 
+/* HID++ 1.0 error codes carried in 0x8F reports.  Receivers use these  */
+/* even when the tunnelled request was HID++ 2.0.                       */
+/*                                                                      */
+/* UNKNOWN_DEVICE: no device is paired at the addressed index.          */
+/* RESOURCE_ERROR: the paired device is unreachable — asleep or powered */
+/* off.  Solaar and the C driver treat this as "try again once the      */
+/* device wakes", not as a protocol failure.                            */
+pub const HIDPP10_ERR_UNKNOWN_DEVICE: u8 = 0x08;
+pub const HIDPP10_ERR_RESOURCE_ERROR: u8 = 0x09;
+
 /* Well-known device indices.                                      */
 /*                                                                 */
 /* Logitech HID++ addresses devices by index:                      */

@@ -73,6 +73,13 @@ pub enum DriverError {
 
     #[error("HID++ 2.0 probe failed: no device responded (tried indices: {indices:02X?})")]
     Hidpp20ProbeFailure { indices: Vec<u8> },
+
+    /* The receiver answered the probe with RESOURCE_ERROR: the paired    */
+    /* device exists but is asleep or powered off.  The registration path */
+    /* parks such devices and re-probes when they wake instead of         */
+    /* retrying immediately.                                              */
+    #[error("Device is unreachable (asleep or powered off)")]
+    DeviceAsleep,
 }
 
 /* HID++ 2.0 error code 0x08: the device is temporarily busy. */

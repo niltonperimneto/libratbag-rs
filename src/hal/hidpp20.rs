@@ -174,6 +174,18 @@ impl From<DriverError> for HidppDriverError {
     }
 }
 
+/* Outcome of a protocol version probe at one device index. */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeIndexResult {
+    /* The device answered with its protocol version (major, minor). */
+    Version(u8, u8),
+    /* The receiver reported RESOURCE_ERROR: a device is paired at this
+     * index but currently asleep or powered off. */
+    Asleep,
+    /* Timeout or a definitive error — no HID++ 2.0 device at this index. */
+    NoResponse,
+}
+
 /* A feature page → runtime index mapping for a known set of capabilities. */
 #[derive(Debug, Default)]
 struct FeatureMap {
@@ -583,15 +595,25 @@ impl Hidpp20Driver {
         }
     }
 
-    /* Attempt a HID++ 2.0 protocol version probe at a specific device index. */
-    /* Returns `Some((major, minor))` on success, `None` on timeout or error. */
-    /*                                                                         */
-    /* Uses a single attempt (max_attempts=1) because a responding device      */
-    /* replies within milliseconds.  The 2-second read deadline is ample for   */
-    /* even busy wireless links, while keeping the total probe phase short     */
-    /* enough that the combined probe+load_profiles stays within the actor's   */
-    /* timeout budget.                                                         */
-    async fn try_probe_index(&self, io: &mut DeviceIo, idx: u8) -> Option<(u8, u8)> {
+    /* Attempt a HID++ 2.0 protocol version probe at a specific device index.
+     *
+     * Two attempts, each with the full read deadline: a responding device
+     * replies within milliseconds, but a wireless link that just woke from
+     * sleep can drop the first request entirely.  Error replies fail FAST
+     * instead of burning the deadline:
+     *
+     * - A receiver 0x8F reply with RESOURCE_ERROR means the paired device
+     *   is asleep/powered off → `Asleep`, so the caller can park the
+     *   device for a wake-triggered re-probe.
+     * - Any other error (UNKNOWN_DEVICE, invalid sub-id from a HID++ 1.0
+     *   only device, …) is a definitive "no HID++ 2.0 device at this
+     *   index" → `NoResponse`.
+     *
+     * Budget note: PROBE_TIMEOUT in engine/actor.rs must cover
+     * (2 indices) × (2 attempts) × READ_TIMEOUT_PER_ATTEMPT. */
+    async fn try_probe_index(&self, io: &mut DeviceIo, idx: u8) -> ProbeIndexResult {
+        const PROBE_ATTEMPTS: u8 = 2;
+
         let request = hidpp::build_hidpp20_request(
             idx,
             ROOT_FEATURE_INDEX,
@@ -600,11 +622,24 @@ impl Hidpp20Driver {
             &[],
         );
 
-        io.request(&request, 20, 1, move |buf| {
+        let expected_fn_sw = hidpp::fn_sw(ROOT_FN_GET_PROTOCOL_VERSION, SW_ID);
+        io.request(&request, 20, PROBE_ATTEMPTS, move |buf| {
             let report = HidppReport::parse(buf)?;
-            if report.is_error() {
-                return None;
+
+            if let Some(code) =
+                report.hidpp20_error_code(idx, ROOT_FEATURE_INDEX, expected_fn_sw)
+            {
+                /* Only the receiver-origin Short 0x8F carries HID++ 1.0
+                 * error codes; a Long 0xFF code 0x09 would be the 2.0
+                 * "UNSUPPORTED" error instead. */
+                if matches!(report, HidppReport::Short { .. })
+                    && code == hidpp::HIDPP10_ERR_RESOURCE_ERROR
+                {
+                    return Some(ProbeIndexResult::Asleep);
+                }
+                return Some(ProbeIndexResult::NoResponse);
             }
+
             if !report.matches_hidpp20_response(
                 idx,
                 ROOT_FEATURE_INDEX,
@@ -614,13 +649,13 @@ impl Hidpp20Driver {
                 return None;
             }
             if let HidppReport::Long { params, .. } = report {
-                Some((params[0], params[1]))
+                Some(ProbeIndexResult::Version(params[0], params[1]))
             } else {
                 None
             }
         })
         .await
-        .ok()
+        .unwrap_or(ProbeIndexResult::NoResponse)
     }
 
     /* Query the Root feature (0x0000, fn 0) to find the runtime index of */
@@ -1426,13 +1461,29 @@ impl super::DeviceDriver for Hidpp20Driver {
         const PROBE_INDICES: &[u8] = &[DEVICE_IDX_CORDED, DEVICE_IDX_RECEIVER];
 
         for &idx in PROBE_INDICES {
-            if let Some((major, minor)) = self.try_probe_index(io, idx).await {
-                self.device_index = idx;
-                info!("HID++ 2.0 device detected at index 0x{idx:02X} (protocol {major}.{minor})");
-                self.discover_features(io).await?;
-                return Ok(());
+            match self.try_probe_index(io, idx).await {
+                ProbeIndexResult::Version(major, minor) => {
+                    self.device_index = idx;
+                    info!(
+                        "HID++ 2.0 device detected at index 0x{idx:02X} (protocol {major}.{minor})"
+                    );
+                    self.discover_features(io).await?;
+                    return Ok(());
+                }
+                ProbeIndexResult::Asleep => {
+                    /* No point probing further indices or retrying now:
+                     * the registration path parks the device and re-probes
+                     * once it emits a report (i.e. when it wakes up). */
+                    info!(
+                        "HID++ 2.0: device at index 0x{idx:02X} is paired but \
+                         unreachable (asleep or powered off)"
+                    );
+                    return Err(crate::hal::DriverError::DeviceAsleep.into());
+                }
+                ProbeIndexResult::NoResponse => {
+                    debug!("HID++ 2.0 probe at index 0x{idx:02X}: no response");
+                }
             }
-            debug!("HID++ 2.0 probe at index 0x{idx:02X}: no response");
         }
 
         Err(HidppDriverError::ProbeFailed(PROBE_INDICES.to_vec()).into())
@@ -2383,6 +2434,65 @@ impl super::DeviceDriver for Hidpp20Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* Probe against a scripted fake receiver that answers the version
+     * ping with a HID++ 1.0 RESOURCE_ERROR (device asleep).  The probe
+     * must fail fast with DriverError::DeviceAsleep instead of burning
+     * the 2-second read deadline per attempt. */
+    #[tokio::test]
+    async fn probe_fails_fast_when_device_asleep() {
+        use crate::hal::DriverError;
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        ours.set_nonblocking(true).expect("set_nonblocking");
+        let file = std::fs::File::from(std::os::unix::io::OwnedFd::from(ours));
+        let mut io = crate::hal::DeviceIo::from_std(
+            file,
+            std::path::PathBuf::from("/dev/fake-hidraw"),
+        )
+        .expect("from_std");
+
+        let responder = tokio::task::spawn_blocking(move || {
+            let mut peer = theirs;
+            use std::io::{Read as _, Write as _};
+            /* The probe at DEVICE_IDX_CORDED (0xFF) sends a 20-byte long
+             * report; answer with the receiver's short 0x8F error:
+             * [0x10, dev, 0x8F, orig_sub_id, orig_fn_sw, RESOURCE_ERROR, 0]. */
+            let mut req = [0u8; 20];
+            peer.read_exact(&mut req).expect("peer read");
+            assert_eq!(req[0], hidpp::REPORT_ID_LONG);
+            assert_eq!(req[1], DEVICE_IDX_CORDED);
+            let err = [
+                hidpp::REPORT_ID_SHORT,
+                DEVICE_IDX_CORDED,
+                hidpp::HIDPP10_ERROR,
+                ROOT_FEATURE_INDEX,
+                hidpp::fn_sw(ROOT_FN_GET_PROTOCOL_VERSION, SW_ID),
+                hidpp::HIDPP10_ERR_RESOURCE_ERROR,
+                0x00,
+            ];
+            peer.write_all(&err).expect("peer write");
+            peer /* keep the socket open until the probe returns */
+        });
+
+        let mut driver = Hidpp20Driver::new();
+        let started = std::time::Instant::now();
+        let err = crate::hal::DeviceDriver::probe(&mut driver, &mut io)
+            .await
+            .expect_err("probe must fail for a sleeping device");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.chain()
+                .any(|c| matches!(c.downcast_ref(), Some(DriverError::DeviceAsleep))),
+            "expected DeviceAsleep in the error chain, got: {err:#}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "probe should fail fast, took {elapsed:?}"
+        );
+        drop(responder);
+    }
 
     /* Build a 256-byte sector with recognisable values at every managed
      * offset, plus sentinel bytes in the gaps that must survive a round trip. */

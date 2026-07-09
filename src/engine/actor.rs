@@ -132,10 +132,12 @@ impl DeviceActor {
 }
 
 /* Maximum time allowed for the protocol probe phase (version ping +
- * feature discovery).  HID++ 2.0 probes up to two device indices;
- * a non-responding index burns one READ_TIMEOUT_PER_ATTEMPT (2 s)
- * cycle, so 8 seconds covers the worst case with headroom. */
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+ * feature discovery).  The HID++ drivers probe up to 2 device indices
+ * with up to 2 attempts each, and every silent attempt burns one full
+ * READ_TIMEOUT_PER_ATTEMPT (2 s, see hal/mod.rs) — 8 s worst case, so
+ * 10 seconds leaves headroom for feature discovery.  Keep this in sync
+ * with PROBE_INDICES/PROBE_ATTEMPTS in hidpp10.rs and hidpp20.rs. */
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /* Maximum time allowed for loading profiles from hardware.  Complex
  * devices (e.g. G502 with 5 onboard profiles and multiple sector
