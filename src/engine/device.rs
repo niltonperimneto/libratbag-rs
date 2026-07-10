@@ -67,7 +67,7 @@ pub struct RgbColor {
 }
 
 /* Color as an RGB triplet exposed over DBus (u32 fields for compatibility). */
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Color {
     pub red: u32,
     pub green: u32,

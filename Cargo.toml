@@ -30,3 +30,8 @@ tokio-stream = "0.1"
 configparser = "3"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+## test-util enables tokio::time auto-advance (start_paused) so driver
+## timeout paths can be unit-tested without real 500 ms waits.
+tokio = { version = "1", features = ["full", "test-util"] }

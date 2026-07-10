@@ -121,12 +121,20 @@ fn hid_set_feature_req(len: usize) -> libc::c_ulong {
     (ioc_readwrite << 30) | (ioc_type << 8) | ioc_nr | ((len as libc::c_ulong) << 16)
 }
 
+/* Transport behind `DeviceIo`: the real hidraw file in production, */
+/* or a scripted in-memory device in unit tests.                     */
+enum IoBackend {
+    File(tokio::fs::File),
+    #[cfg(test)]
+    Mock(mock::MockHid),
+}
+
 /* Async wrapper around a `/dev/hidraw` file descriptor. */
 /*                                                       */
 /* All hardware I/O goes through this struct so that     */
 /* drivers never touch raw file handles directly.        */
 pub struct DeviceIo {
-    file: tokio::fs::File,
+    backend: IoBackend,
     path: std::path::PathBuf,
     /* Reports seen during `request()` that were valid HID++ but did not
      * match the pending command.  These are unsolicited hardware events
@@ -146,10 +154,26 @@ impl DeviceIo {
             .with_context(|| format!("Failed to open hidraw device {}", path.display()))?;
 
         Ok(Self {
-            file,
+            backend: IoBackend::File(file),
             path: path.to_path_buf(),
             pending_events: Vec::new(),
         })
+    }
+
+    /* Build a `DeviceIo` backed by a scripted mock device, along with a
+     * handle for inspecting the traffic after the fact.  Lets driver
+     * probe/load/commit flows run in unit tests without hardware. */
+    #[cfg(test)]
+    pub(crate) fn with_mock(script: Vec<mock::MockExchange>) -> (Self, mock::MockHandle) {
+        let (hid, handle) = mock::MockHid::scripted(script);
+        (
+            Self {
+                backend: IoBackend::Mock(hid),
+                path: std::path::PathBuf::from("/dev/mock-hidraw"),
+                pending_events: Vec::new(),
+            },
+            handle,
+        )
     }
 
     /* Return the path of the underlying hidraw device node. */
@@ -159,21 +183,29 @@ impl DeviceIo {
 
     /* Write a raw HID report to the device. */
     pub async fn write_report(&mut self, buf: &[u8]) -> Result<()> {
-        self.file
-            .write_all(buf)
-            .await
-            .with_context(|| format!("Write failed on {}", self.path.display()))?;
+        match &mut self.backend {
+            IoBackend::File(file) => {
+                file.write_all(buf)
+                    .await
+                    .with_context(|| format!("Write failed on {}", self.path.display()))?;
+            }
+            #[cfg(test)]
+            IoBackend::Mock(hid) => hid.write_report(buf)?,
+        }
         debug!("TX {} bytes: {:02x?}", buf.len(), buf);
         Ok(())
     }
 
     /* Read a single HID report from the device (blocks until data arrives). */
     pub async fn read_report(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let n = self
-            .file
-            .read(buf)
-            .await
-            .with_context(|| format!("Read failed on {}", self.path.display()))?;
+        let n = match &mut self.backend {
+            IoBackend::File(file) => file
+                .read(buf)
+                .await
+                .with_context(|| format!("Read failed on {}", self.path.display()))?,
+            #[cfg(test)]
+            IoBackend::Mock(hid) => hid.read_report(buf).await?,
+        };
         debug!("RX {} bytes: {:02x?}", n, &buf[..n]);
         Ok(n)
     }
@@ -184,7 +216,7 @@ impl DeviceIo {
     /* kernel fills the remaining bytes with the report data and   */
     /* returns the total number of bytes written.                  */
     pub fn get_feature_report(&self, buf: &mut [u8]) -> Result<usize, DriverError> {
-        let fd = self.file.as_raw_fd();
+        let fd = self.raw_fd()?;
         let req = hid_get_feature_req(buf.len());
 
         /* SAFETY: `fd` is a valid open file descriptor for the     */
@@ -207,7 +239,7 @@ impl DeviceIo {
     /* `buf[0]` must contain the report ID. Returns the number of  */
     /* bytes accepted by the kernel.                               */
     pub fn set_feature_report(&self, buf: &[u8]) -> Result<usize, DriverError> {
-        let fd = self.file.as_raw_fd();
+        let fd = self.raw_fd()?;
         let req = hid_set_feature_req(buf.len());
 
         /* SAFETY: `fd` is a valid open file descriptor for the     */
@@ -223,6 +255,20 @@ impl DeviceIo {
         let n = res as usize;
         debug!("SET_FEATURE {} bytes: {:02x?}", n, &buf[..n]);
         Ok(n)
+    }
+
+    /* Return the raw fd for feature-report ioctls.  Only the file  */
+    /* backend has one; the mock backend does not support feature   */
+    /* reports (no driver under test currently needs them).         */
+    fn raw_fd(&self) -> Result<std::os::unix::io::RawFd, DriverError> {
+        match &self.backend {
+            IoBackend::File(file) => Ok(file.as_raw_fd()),
+            #[cfg(test)]
+            IoBackend::Mock(_) => Err(DriverError::IoctlFailed(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "feature reports are not supported by the mock backend",
+            ))),
+        }
     }
 
     /* Send a report and wait for a matching response.             */
@@ -326,6 +372,128 @@ impl DeviceIo {
      * and forwards the reports to `DeviceDriver::handle_event`. */
     pub fn drain_events(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_events)
+    }
+}
+
+/* Scripted in-memory HID device for driver unit tests.             */
+/*                                                                  */
+/* A script is a sequence of exchanges consumed one per write: each */
+/* write pops the next exchange (optionally asserting the written   */
+/* bytes) and queues its reply for the following read.  A read with */
+/* nothing queued pends forever, exactly like a mute hidraw node —  */
+/* combine with `tokio::test(start_paused = true)` to exercise      */
+/* driver timeout paths instantly.                                  */
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::{bail, Result};
+
+    /* What the mock device does after accepting a write. */
+    pub enum MockReply {
+        /* Deliver these bytes on the next read. */
+        Data(Vec<u8>),
+        /* Stay silent: the next read pends forever (timeout testing). */
+        Silence,
+        /* Fail the write itself with a hard I/O error. */
+        WriteError,
+    }
+
+    /* One scripted write→reply exchange. */
+    pub struct MockExchange {
+        /* When `Some`, the written report must match these bytes exactly. */
+        pub expect: Option<Vec<u8>>,
+        pub reply: MockReply,
+    }
+
+    impl MockExchange {
+        pub fn reply(data: Vec<u8>) -> Self {
+            Self { expect: None, reply: MockReply::Data(data) }
+        }
+
+        pub fn expect_reply(expect: Vec<u8>, data: Vec<u8>) -> Self {
+            Self { expect: Some(expect), reply: MockReply::Data(data) }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        script: VecDeque<MockExchange>,
+        writes: Vec<Vec<u8>>,
+        queued: VecDeque<Vec<u8>>,
+    }
+
+    pub(crate) struct MockHid {
+        state: Arc<Mutex<MockState>>,
+    }
+
+    /* Test-side view of the mock: inspect traffic after driving the driver. */
+    #[derive(Clone)]
+    pub(crate) struct MockHandle {
+        state: Arc<Mutex<MockState>>,
+    }
+
+    impl MockHid {
+        pub(crate) fn scripted(script: Vec<MockExchange>) -> (Self, MockHandle) {
+            let state = Arc::new(Mutex::new(MockState {
+                script: script.into(),
+                ..MockState::default()
+            }));
+            (Self { state: state.clone() }, MockHandle { state })
+        }
+
+        pub(super) fn write_report(&mut self, buf: &[u8]) -> Result<()> {
+            let mut st = self.state.lock().unwrap();
+            st.writes.push(buf.to_vec());
+
+            let Some(exchange) = st.script.pop_front() else {
+                bail!("MockHid: unexpected write, script exhausted: {:02x?}", buf);
+            };
+            if let Some(expect) = &exchange.expect
+                && buf != &expect[..]
+            {
+                bail!(
+                    "MockHid: write mismatch\n  expected: {:02x?}\n  actual:   {:02x?}",
+                    expect, buf
+                );
+            }
+            match exchange.reply {
+                MockReply::Data(data) => st.queued.push_back(data),
+                MockReply::Silence => { /* nothing queued: next read pends */ }
+                MockReply::WriteError => bail!("MockHid: scripted write error"),
+            }
+            Ok(())
+        }
+
+        pub(super) async fn read_report(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let reply = self.state.lock().unwrap().queued.pop_front();
+            match reply {
+                Some(data) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                /* Mute device: never resolves, mirrors a real hidraw
+                 * node with no data. Callers race this against a timeout. */
+                None => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    impl MockHandle {
+        /* All reports written to the device, in order. */
+        pub(crate) fn writes(&self) -> Vec<Vec<u8>> {
+            self.state.lock().unwrap().writes.clone()
+        }
+
+        /* True once every scripted exchange has been consumed. */
+        pub(crate) fn script_exhausted(&self) -> bool {
+            self.state.lock().unwrap().script.is_empty()
+        }
     }
 }
 
