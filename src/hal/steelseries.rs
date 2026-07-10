@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
@@ -160,16 +160,57 @@ impl Report {
 }
 
 /* ---------------------------------------------------------------------- */
+/* Protocol version                                                       */
+/* ---------------------------------------------------------------------- */
+
+/* Wire protocol generation, selected by the device database's DeviceVersion
+ * field.  The four generations share a command vocabulary but differ in
+ * opcodes, report sizes, byte offsets, and framing (see the module header). */
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolVersion {
+    V1,
+    V2,
+    V3,
+    V4,
+}
+
+impl TryFrom<u32> for ProtocolVersion {
+    type Error = anyhow::Error; /* becomes SteelSeriesError in a later phase */
+
+    fn try_from(value: u32) -> Result<Self> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
+            4 => Ok(Self::V4),
+            other => Err(anyhow!(
+                "SteelSeries: unsupported DeviceVersion {other} (expected 1-4)"
+            )),
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------- */
 /* Driver Instance                                                        */
 /* ---------------------------------------------------------------------- */
 
 pub struct SteelseriesDriver {
-    version: u8,
+    /* None until load_profiles has parsed the device database entry. */
+    version: Option<ProtocolVersion>,
 }
 
 impl SteelseriesDriver {
     pub fn new() -> Self {
-        Self { version: 0 }
+        Self { version: None }
+    }
+
+    /* The parsed protocol version.  Every command path runs after
+     * load_profiles (the actor aborts device registration if it fails), so
+     * this error is an initialization-order guard, not a runtime state. */
+    fn version(&self) -> Result<ProtocolVersion> {
+        self.version.ok_or_else(|| {
+            anyhow!("SteelSeries: driver used before load_profiles initialized the protocol version")
+        })
     }
 }
 
@@ -216,10 +257,14 @@ impl DeviceDriver for SteelseriesDriver {
     }
 
     async fn load_profiles(&mut self, io: &mut DeviceIo, info: &mut DeviceInfo) -> Result<()> {
-        self.version = info.driver_config.device_version.map(|v| v as u8).unwrap_or_else(|| {
-            warn!("DeviceVersion not found in config, defaulting to 1");
-            1
-        });
+        /* Reject invalid protocol state up front: driving a device with
+         * guessed V1 opcodes it may not speak is worse than not driving it.
+         * Every shipped steelseries .device file sets DeviceVersion. */
+        let raw = info.driver_config.device_version.ok_or_else(|| {
+            anyhow!("SteelSeries: DeviceVersion missing from device database entry")
+        })?;
+        let version = ProtocolVersion::try_from(raw)?;
+        self.version = Some(version);
 
         let button_count = info.driver_config.buttons.unwrap_or(0) as u32;
         let led_count = info.driver_config.leds.unwrap_or(0) as u32;
@@ -254,7 +299,7 @@ impl DeviceDriver for SteelseriesDriver {
                 .collect();
 
             let leds = (0..led_count)
-                .map(|led_id| self.build_led(led_id, senseiraw))
+                .map(|led_id| build_led(version, led_id, senseiraw))
                 .collect();
 
             let mut profile = ProfileInfo {
@@ -363,33 +408,34 @@ fn build_button(btn_id: u32, button_count: u32, senseiraw: bool) -> ButtonInfo {
     }
 }
 
-impl SteelseriesDriver {
-    fn build_led(&self, led_id: u32, senseiraw: bool) -> LedInfo {
-        /* V1 devices support Off, Solid, Breathing; V2+ add Cycle. */
-        let mut modes = vec![LedMode::Off, LedMode::Solid, LedMode::Breathing];
-        if self.version >= 2 {
-            modes.push(LedMode::Cycle);
-        }
+fn build_led(version: ProtocolVersion, led_id: u32, senseiraw: bool) -> LedInfo {
+    /* V1 devices support Off, Solid, Breathing; V2+ add Cycle. */
+    let mut modes = vec![LedMode::Off, LedMode::Solid, LedMode::Breathing];
+    if matches!(
+        version,
+        ProtocolVersion::V2 | ProtocolVersion::V3 | ProtocolVersion::V4
+    ) {
+        modes.push(LedMode::Cycle);
+    }
 
-        let (color_depth, color, brightness) = if senseiraw {
-            /* Monochrome – brightness controls intensity */
-            (1, Color::default(), 255)
-        } else {
-            /* RGB_888 – default to blue as in the C driver */
-            (3, Color { red: 0, green: 0, blue: 255 }, 255)
-        };
+    let (color_depth, color, brightness) = if senseiraw {
+        /* Monochrome – brightness controls intensity */
+        (1, Color::default(), 255)
+    } else {
+        /* RGB_888 – default to blue as in the C driver */
+        (3, Color { red: 0, green: 0, blue: 255 }, 255)
+    };
 
-        LedInfo {
-            index: led_id,
-            mode: LedMode::Solid,
-            modes,
-            color,
-            secondary_color: Color::default(),
-            tertiary_color: Color::default(),
-            color_depth,
-            effect_duration: 1000,
-            brightness,
-        }
+    LedInfo {
+        index: led_id,
+        mode: LedMode::Solid,
+        modes,
+        color,
+        secondary_color: Color::default(),
+        tertiary_color: Color::default(),
+        color_depth,
+        effect_duration: 1000,
+        brightness,
     }
 }
 
@@ -443,8 +489,8 @@ impl SteelseriesDriver {
         /* Hardware stores (dpi / step) - 1. */
         let scaled = (dpi_val / step).saturating_sub(1) as u8;
 
-        let report = match self.version {
-            1 => {
+        let report = match self.version()? {
+            ProtocolVersion::V1 => {
                 /* V1 with an explicit DPI list reverse-looks up the index
                  * (the C driver enumerates entries in reverse). */
                 let scaled = if res.dpi_list.is_empty() {
@@ -457,35 +503,35 @@ impl SteelseriesDriver {
                 r.param(1, res_id).param(2, scaled);
                 r
             }
-            2 => {
+            ProtocolVersion::V2 => {
                 let mut r = Report::output(STEELSERIES_ID_DPI, STEELSERIES_REPORT_SIZE);
                 r.param(2, res_id)
                     .param(3, scaled)
                     .param(6, STEELSERIES_DPI_MAGIC_MARKER);
                 r
             }
-            3 => {
+            ProtocolVersion::V3 => {
                 let mut r = Report::output(STEELSERIES_ID_DPI_PROTOCOL3, STEELSERIES_REPORT_SIZE);
                 r.param(2, res_id)
                     .param(3, scaled)
                     .param(5, STEELSERIES_DPI_MAGIC_MARKER);
                 r
             }
-            4 => {
+            ProtocolVersion::V4 => {
                 /* V4 uses the 64-byte report, not SHORT. */
                 let mut r = Report::output(STEELSERIES_ID_DPI_PROTOCOL4, STEELSERIES_REPORT_SIZE);
                 r.param(1, res_id).param(2, scaled);
                 r
             }
-            _ => return Ok(()),
         };
 
         self.send(io, &report).await
     }
 
     async fn write_report_rate(&self, io: &mut DeviceIo, hz: u32) -> Result<()> {
-        let report = match self.version {
-            1 | 4 => {
+        let version = self.version()?;
+        let report = match version {
+            ProtocolVersion::V1 | ProtocolVersion::V4 => {
                 /* Discretized rate codes: 1000→0x01, 500→0x02, 250→0x03, 125→0x04. */
                 let rate_code: u8 = if hz >= 1000 {
                     0x01
@@ -496,7 +542,7 @@ impl SteelseriesDriver {
                 } else {
                     0x03
                 };
-                let opcode = if self.version == 1 {
+                let opcode = if version == ProtocolVersion::V1 {
                     STEELSERIES_ID_REPORT_RATE_SHORT
                 } else {
                     STEELSERIES_ID_REPORT_RATE_PROTOCOL4
@@ -505,9 +551,9 @@ impl SteelseriesDriver {
                 r.param(2, rate_code);
                 r
             }
-            2 | 3 => {
+            ProtocolVersion::V2 | ProtocolVersion::V3 => {
                 let rate_val = (1000 / hz.max(125)) as u8;
-                let opcode = if self.version == 2 {
+                let opcode = if version == ProtocolVersion::V2 {
                     STEELSERIES_ID_REPORT_RATE
                 } else {
                     STEELSERIES_ID_REPORT_RATE_PROTOCOL3
@@ -516,7 +562,6 @@ impl SteelseriesDriver {
                 r.param(2, rate_val);
                 r
             }
-            _ => return Ok(()),
         };
 
         self.send(io, &report).await
@@ -573,7 +618,7 @@ impl SteelseriesDriver {
 
         /* V3 carries buttons as a feature report: drop the report-id byte so
          * the opcode becomes the feature report number. */
-        if self.version == 3 {
+        if self.version()? == ProtocolVersion::V3 {
             self.dispatch(io, true, &report.bytes()[1..report_size], STEELSERIES_ID_BUTTONS, SETTLE)
                 .await
         } else {
@@ -583,11 +628,12 @@ impl SteelseriesDriver {
     }
 
     async fn write_save(&self, io: &mut DeviceIo) -> Result<()> {
-        let (opcode, len) = match self.version {
-            1 => (STEELSERIES_ID_SAVE_SHORT, STEELSERIES_REPORT_SIZE_SHORT),
-            2 => (STEELSERIES_ID_SAVE, STEELSERIES_REPORT_SIZE),
-            3 | 4 => (STEELSERIES_ID_SAVE_PROTOCOL3, STEELSERIES_REPORT_SIZE),
-            _ => return Ok(()),
+        let (opcode, len) = match self.version()? {
+            ProtocolVersion::V1 => (STEELSERIES_ID_SAVE_SHORT, STEELSERIES_REPORT_SIZE_SHORT),
+            ProtocolVersion::V2 => (STEELSERIES_ID_SAVE, STEELSERIES_REPORT_SIZE),
+            ProtocolVersion::V3 | ProtocolVersion::V4 => {
+                (STEELSERIES_ID_SAVE_PROTOCOL3, STEELSERIES_REPORT_SIZE)
+            }
         };
         let report = Report::output(opcode, len);
         self.dispatch(io, false, report.bytes(), opcode, SETTLE_SAVE)
@@ -599,11 +645,14 @@ impl SteelseriesDriver {
     /* ------------------------------------------------------------------ */
 
     async fn write_led(&self, io: &mut DeviceIo, led: &LedInfo, info: &DeviceInfo) -> Result<()> {
-        match self.version {
-            1 => self.write_led_v1(io, led, info).await,
-            2 => self.write_led_v2(io, led).await,
-            3 => self.write_led_v3(io, led).await,
-            _ => Ok(()),
+        match self.version()? {
+            ProtocolVersion::V1 => self.write_led_v1(io, led, info).await,
+            ProtocolVersion::V2 => self.write_led_v2(io, led).await,
+            ProtocolVersion::V3 => self.write_led_v3(io, led).await,
+            /* No V4 LED command exists in the protocol (C driver parity);
+             * the only V4 device (Rival 650) declares Leds=0, so reaching
+             * this arm means the device database entry is wrong. */
+            ProtocolVersion::V4 => bail!("SteelSeries V4 has no LED protocol"),
         }
     }
 
@@ -727,11 +776,15 @@ impl SteelseriesDriver {
     /* ------------------------------------------------------------------ */
 
     async fn read_firmware_version(&self, io: &mut DeviceIo) -> Result<String> {
-        let (opcode, len) = match self.version {
-            1 => (STEELSERIES_ID_FIRMWARE_PROTOCOL1, STEELSERIES_REPORT_SIZE_SHORT),
-            2 => (STEELSERIES_ID_FIRMWARE_PROTOCOL2, STEELSERIES_REPORT_SIZE),
-            3 => (STEELSERIES_ID_FIRMWARE_PROTOCOL3, STEELSERIES_REPORT_SIZE),
-            _ => return Ok(String::new()),
+        let (opcode, len) = match self.version()? {
+            ProtocolVersion::V1 => {
+                (STEELSERIES_ID_FIRMWARE_PROTOCOL1, STEELSERIES_REPORT_SIZE_SHORT)
+            }
+            ProtocolVersion::V2 => (STEELSERIES_ID_FIRMWARE_PROTOCOL2, STEELSERIES_REPORT_SIZE),
+            ProtocolVersion::V3 => (STEELSERIES_ID_FIRMWARE_PROTOCOL3, STEELSERIES_REPORT_SIZE),
+            /* V4 exposes no firmware query (C driver parity): report an
+             * empty version rather than probing with a foreign opcode. */
+            ProtocolVersion::V4 => return Ok(String::new()),
         };
 
         self.send(io, &Report::output(opcode, len)).await?;
@@ -752,10 +805,13 @@ impl SteelseriesDriver {
     }
 
     async fn read_settings(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
-        let settings_id = match self.version {
-            2 => STEELSERIES_ID_SETTINGS,
-            3 => STEELSERIES_ID_SETTINGS_PROTOCOL3,
-            _ => return Ok(()),
+        let version = self.version()?;
+        let settings_id = match version {
+            ProtocolVersion::V2 => STEELSERIES_ID_SETTINGS,
+            ProtocolVersion::V3 => STEELSERIES_ID_SETTINGS_PROTOCOL3,
+            /* V1 and V4 have no settings-read command (C driver parity):
+             * the defaults seeded by load_profiles stand. */
+            ProtocolVersion::V1 | ProtocolVersion::V4 => return Ok(()),
         };
 
         self.send(io, &Report::output(settings_id, STEELSERIES_REPORT_SIZE))
@@ -771,30 +827,35 @@ impl SteelseriesDriver {
             return Ok(());
         }
 
-        if self.version == 2 {
-            let active_resolution = buf.get(1).copied().unwrap_or(0).saturating_sub(1);
-            for res in &mut profile.resolutions {
-                res.is_active = res.index == active_resolution as u32;
-                let dpi_idx = 2 + res.index as usize * 2;
-                if dpi_idx < n {
-                    let dpi_val = 100 * (1 + buf.get(dpi_idx).copied().unwrap_or(0) as u32);
-                    res.dpi = Dpi::Unified(dpi_val);
+        match version {
+            ProtocolVersion::V2 => {
+                let active_resolution = buf.get(1).copied().unwrap_or(0).saturating_sub(1);
+                for res in &mut profile.resolutions {
+                    res.is_active = res.index == active_resolution as u32;
+                    let dpi_idx = 2 + res.index as usize * 2;
+                    if dpi_idx < n {
+                        let dpi_val = 100 * (1 + buf.get(dpi_idx).copied().unwrap_or(0) as u32);
+                        res.dpi = Dpi::Unified(dpi_val);
+                    }
                 }
-            }
 
-            for led in &mut profile.leds {
-                let offset = 6 + led.index as usize * 3;
-                if offset + 2 < n {
-                    led.color.red = buf.get(offset).copied().unwrap_or(0) as u32;
-                    led.color.green = buf.get(offset + 1).copied().unwrap_or(0) as u32;
-                    led.color.blue = buf.get(offset + 2).copied().unwrap_or(0) as u32;
+                for led in &mut profile.leds {
+                    let offset = 6 + led.index as usize * 3;
+                    if offset + 2 < n {
+                        led.color.red = buf.get(offset).copied().unwrap_or(0) as u32;
+                        led.color.green = buf.get(offset + 1).copied().unwrap_or(0) as u32;
+                        led.color.blue = buf.get(offset + 2).copied().unwrap_or(0) as u32;
+                    }
                 }
             }
-        } else if self.version == 3 {
-            let active_resolution = buf.get(0).copied().unwrap_or(0).saturating_sub(1);
-            for res in &mut profile.resolutions {
-                res.is_active = res.index == active_resolution as u32;
+            ProtocolVersion::V3 => {
+                let active_resolution = buf.get(0).copied().unwrap_or(0).saturating_sub(1);
+                for res in &mut profile.resolutions {
+                    res.is_active = res.index == active_resolution as u32;
+                }
             }
+            /* Unreachable: returned above before any I/O. */
+            ProtocolVersion::V1 | ProtocolVersion::V4 => {}
         }
 
         Ok(())
@@ -956,4 +1017,100 @@ fn write_cycle_points(buf: &mut [u8], header_start: usize, points: &[CyclePoint]
     }
 
     points.len() as u8
+}
+
+/* ---------------------------------------------------------------------- */
+/* Tests                                                                  */
+/* ---------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::device_database::{DeviceEntry, DpiRange, DriverConfig};
+    use crate::hal::mock::MockExchange;
+
+    fn make_info(device_version: Option<u32>) -> DeviceInfo {
+        let entry = DeviceEntry {
+            name: "Test Mouse".into(),
+            driver: "steelseries".into(),
+            device_type: "mouse".into(),
+            matches: Vec::new(),
+            driver_config: Some(DriverConfig {
+                buttons: Some(6),
+                leds: Some(1),
+                device_version,
+                dpi_range: Some(DpiRange { min: 100, max: 12000, step: 100 }),
+                ..DriverConfig::default()
+            }),
+        };
+        DeviceInfo::from_entry("test0", "Test Mouse", 0x03, 0x1038, 0x1702, &entry)
+    }
+
+    #[test]
+    fn protocol_version_parses_valid_range() {
+        assert_eq!(ProtocolVersion::try_from(1).unwrap(), ProtocolVersion::V1);
+        assert_eq!(ProtocolVersion::try_from(2).unwrap(), ProtocolVersion::V2);
+        assert_eq!(ProtocolVersion::try_from(3).unwrap(), ProtocolVersion::V3);
+        assert_eq!(ProtocolVersion::try_from(4).unwrap(), ProtocolVersion::V4);
+    }
+
+    #[test]
+    fn protocol_version_rejects_out_of_range() {
+        assert!(ProtocolVersion::try_from(0).is_err());
+        assert!(ProtocolVersion::try_from(5).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_profiles_rejects_missing_device_version() {
+        let (mut io, handle) = DeviceIo::with_mock(Vec::new());
+        let mut info = make_info(None);
+        let mut drv = SteelseriesDriver::new();
+
+        let err = drv.load_profiles(&mut io, &mut info).await.unwrap_err();
+        assert!(err.to_string().contains("DeviceVersion missing"));
+        assert!(drv.version.is_none());
+        assert!(handle.writes().is_empty(), "must fail before any I/O");
+    }
+
+    #[tokio::test]
+    async fn load_profiles_rejects_invalid_device_version() {
+        let (mut io, handle) = DeviceIo::with_mock(Vec::new());
+        let mut info = make_info(Some(7));
+        let mut drv = SteelseriesDriver::new();
+
+        let err = drv.load_profiles(&mut io, &mut info).await.unwrap_err();
+        assert!(err.to_string().contains("unsupported DeviceVersion 7"));
+        assert!(drv.version.is_none());
+        assert!(handle.writes().is_empty(), "must fail before any I/O");
+    }
+
+    /* V1 end-to-end load: settings read is a documented no-op, so the only
+     * wire traffic is the firmware query (write) and its reply. */
+    #[tokio::test]
+    async fn load_profiles_v1_seeds_state_and_reads_firmware() {
+        let fw_request =
+            Report::output(STEELSERIES_ID_FIRMWARE_PROTOCOL1, STEELSERIES_REPORT_SIZE_SHORT);
+        let (mut io, handle) = DeviceIo::with_mock(vec![MockExchange::expect_reply(
+            fw_request.bytes().to_vec(),
+            vec![0x02, 0x01], /* minor, major -> "1.2" */
+        )]);
+        let mut info = make_info(Some(1));
+        let mut drv = SteelseriesDriver::new();
+
+        drv.load_profiles(&mut io, &mut info).await.unwrap();
+
+        assert_eq!(drv.version, Some(ProtocolVersion::V1));
+        assert_eq!(info.firmware_version, "1.2");
+        assert_eq!(info.profiles.len(), 1);
+
+        let profile = &info.profiles[0];
+        assert_eq!(profile.resolutions.len(), STEELSERIES_NUM_DPI as usize);
+        assert_eq!(profile.buttons.len(), 6);
+        /* V1 LEDs must not advertise Cycle. */
+        assert_eq!(
+            profile.leds[0].modes,
+            vec![LedMode::Off, LedMode::Solid, LedMode::Breathing]
+        );
+        assert!(handle.script_exhausted());
+    }
 }
