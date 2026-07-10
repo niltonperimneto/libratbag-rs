@@ -158,22 +158,28 @@ impl DeviceIo {
     }
 
     /* Write a raw HID report to the device. */
-    pub async fn write_report(&mut self, buf: &[u8]) -> Result<()> {
+    pub async fn write_report(&mut self, buf: &[u8]) -> Result<(), DriverError> {
         self.file
             .write_all(buf)
             .await
-            .with_context(|| format!("Write failed on {}", self.path.display()))?;
+            .map_err(|source| DriverError::Io {
+                device: self.path.display().to_string(),
+                source,
+            })?;
         debug!("TX {} bytes: {:02x?}", buf.len(), buf);
         Ok(())
     }
 
     /* Read a single HID report from the device (blocks until data arrives). */
-    pub async fn read_report(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn read_report(&mut self, buf: &mut [u8]) -> Result<usize, DriverError> {
         let n = self
             .file
             .read(buf)
             .await
-            .with_context(|| format!("Read failed on {}", self.path.display()))?;
+            .map_err(|source| DriverError::Io {
+                device: self.path.display().to_string(),
+                source,
+            })?;
         debug!("RX {} bytes: {:02x?}", n, &buf[..n]);
         Ok(n)
     }
@@ -244,7 +250,7 @@ impl DeviceIo {
         report_size: usize,
         max_attempts: u8,
         mut matcher: F,
-    ) -> Result<T>
+    ) -> Result<T, DriverError>
     where
         F: FnMut(&[u8]) -> Option<T>,
     {
@@ -258,8 +264,7 @@ impl DeviceIo {
             return Err(DriverError::BufferTooSmall {
                 expected: MAX_HID_REPORT,
                 actual: report_size,
-            }
-            .into());
+            });
         }
 
         for attempt in 1..=max_attempts {
@@ -317,8 +322,7 @@ impl DeviceIo {
 
         Err(DriverError::Timeout {
             attempts: max_attempts,
-        }
-        .into())
+        })
     }
 
     /* Drain all unsolicited HID++ events that were buffered during
