@@ -340,7 +340,7 @@ impl DeviceIo {
     pub async fn wait_readable(&self) -> Result<(), DriverError> {
         match &self.backend {
             IoBackend::File(fd) => {
-                fd.readable()
+                let _guard = fd.readable()
                     .await
                     .map_err(|source| DriverError::Io {
                         device: self.path.display().to_string(),
@@ -350,11 +350,7 @@ impl DeviceIo {
             }
             #[cfg(test)]
             IoBackend::Mock(hid) => {
-                let queued = {
-                    let state = hid.state.lock().unwrap();
-                    !state.queued.is_empty()
-                };
-                if queued {
+                if hid.has_queued() {
                     Ok(())
                 } else {
                     std::future::pending::<()>().await;
@@ -370,32 +366,43 @@ impl DeviceIo {
     pub fn try_read_report(&mut self, buf: &mut [u8]) -> Result<Option<usize>, DriverError> {
         match &mut self.backend {
             IoBackend::File(fd) => {
-                match (&mut &*fd.get_ref()).read(buf) {
-                    Ok(n) => {
-                        debug!("RX {} bytes: {:02x?}", n, &buf[..n]);
-                        Ok(Some(n))
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                    Err(source) => {
-                        Err(DriverError::Io {
-                            device: self.path.display().to_string(),
-                            source,
-                        })
+                /* Go through the AsyncFd readiness guard rather than
+                 * reading the fd directly: `try_io` calls `clear_ready()`
+                 * when the read hits EAGAIN.  Without that, tokio's cached
+                 * readiness stays set after the queue drains, the actor's
+                 * next `wait_readable()` returns instantly, and the idle
+                 * loop degenerates into a busy spin that starves the
+                 * command channel (coop budget never resets), wedging the
+                 * whole actor.  A no-op waker keeps this non-blocking:
+                 * `Pending` simply means "no cached readiness" = no data. */
+                use std::future::Future;
+                use std::task::{Context, Poll, Waker};
+
+                let mut cx = Context::from_waker(Waker::noop());
+                let readable = std::pin::pin!(fd.readable());
+                match readable.poll(&mut cx) {
+                    Poll::Pending => Ok(None),
+                    Poll::Ready(Err(source)) => Err(DriverError::Io {
+                        device: self.path.display().to_string(),
+                        source,
+                    }),
+                    Poll::Ready(Ok(mut guard)) => {
+                        match guard.try_io(|inner| (&mut &*inner.get_ref()).read(buf)) {
+                            Ok(Ok(n)) => {
+                                debug!("RX {} bytes: {:02x?}", n, &buf[..n]);
+                                Ok(Some(n))
+                            }
+                            Ok(Err(source)) => Err(DriverError::Io {
+                                device: self.path.display().to_string(),
+                                source,
+                            }),
+                            Err(_would_block) => Ok(None),
+                        }
                     }
                 }
             }
             #[cfg(test)]
-            IoBackend::Mock(hid) => {
-                let mut state = hid.state.lock().unwrap();
-                match state.queued.pop_front() {
-                    Some(data) => {
-                        let n = data.len().min(buf.len());
-                        buf[..n].copy_from_slice(&data[..n]);
-                        Ok(Some(n))
-                    }
-                    None => Ok(None),
-                }
-            }
+            IoBackend::Mock(hid) => Ok(hid.try_pop_queued(buf)),
         }
     }
 
@@ -675,6 +682,20 @@ pub(crate) mod mock {
                     unreachable!()
                 }
             }
+        }
+
+        /* True if the mock has at least one queued report ready to read. */
+        pub(super) fn has_queued(&self) -> bool {
+            !self.state.lock().unwrap().queued.is_empty()
+        }
+
+        /* Pop the next queued report without blocking; returns `None` if
+         * the queue is empty (mirrors EAGAIN on a real fd). */
+        pub(super) fn try_pop_queued(&mut self, buf: &mut [u8]) -> Option<usize> {
+            let data = self.state.lock().unwrap().queued.pop_front()?;
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            Some(n)
         }
     }
 

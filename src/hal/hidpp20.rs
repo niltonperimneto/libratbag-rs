@@ -4,7 +4,7 @@
 /* Logitech gaming mice. Each capability is exposed as a numbered "feature" */
 /* that must be discovered at probe time via the Root feature (0x0000). */
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::time::{Duration, sleep};
@@ -170,6 +170,24 @@ impl From<DriverError> for HidppDriverError {
         match e {
             DriverError::Timeout { .. } => Self::DeviceTimeout,
             other => Self::Transport(other),
+        }
+    }
+}
+
+impl HidppDriverError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::DeviceTimeout => true,
+            Self::ProtocolError { code, .. } => *code == crate::hal::HIDPP20_ERR_BUSY,
+            Self::Transport(e) => matches!(
+                e,
+                DriverError::Timeout { .. }
+                    | DriverError::Hidpp20Error {
+                        error_code: crate::hal::HIDPP20_ERR_BUSY,
+                        ..
+                    }
+            ),
+            _ => false,
         }
     }
 }
@@ -839,7 +857,7 @@ impl Hidpp20Driver {
                 info!("HID++ 2.0: special keys/buttons (0x1b04) reports {count} controls");
                 Ok(count)
             }
-            Err(e) if crate::hal::is_transient_error(&e) => {
+            Err(e) if e.is_transient() => {
                 Err(e).context("transient failure querying 0x1b04 control count")
             }
             Err(e) => {

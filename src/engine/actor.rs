@@ -62,7 +62,7 @@ const MAX_IDLE_DRAIN: usize = 32;
 /* What woke the actor loop up. */
 enum Wakeup {
     Message(Option<ActorMessage>),
-    IdleReadable(std::io::Result<()>),
+    IdleReadable(Result<(), crate::hal::DriverError>),
 }
 
 /* The device actor itself. Owns the I/O handle and driver instance. */
