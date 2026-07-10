@@ -192,6 +192,14 @@ impl DeviceIo {
             #[cfg(test)]
             IoBackend::Mock(hid) => hid.write_report(buf)?,
         }
+    pub async fn write_report(&mut self, buf: &[u8]) -> Result<(), DriverError> {
+        self.file
+            .write_all(buf)
+            .await
+            .map_err(|source| DriverError::Io {
+                device: self.path.display().to_string(),
+                source,
+            })?;
         debug!("TX {} bytes: {:02x?}", buf.len(), buf);
         Ok(())
     }
@@ -206,6 +214,15 @@ impl DeviceIo {
             #[cfg(test)]
             IoBackend::Mock(hid) => hid.read_report(buf).await?,
         };
+    pub async fn read_report(&mut self, buf: &mut [u8]) -> Result<usize, DriverError> {
+        let n = self
+            .file
+            .read(buf)
+            .await
+            .map_err(|source| DriverError::Io {
+                device: self.path.display().to_string(),
+                source,
+            })?;
         debug!("RX {} bytes: {:02x?}", n, &buf[..n]);
         Ok(n)
     }
@@ -290,7 +307,7 @@ impl DeviceIo {
         report_size: usize,
         max_attempts: u8,
         mut matcher: F,
-    ) -> Result<T>
+    ) -> Result<T, DriverError>
     where
         F: FnMut(&[u8]) -> Option<T>,
     {
@@ -304,8 +321,7 @@ impl DeviceIo {
             return Err(DriverError::BufferTooSmall {
                 expected: MAX_HID_REPORT,
                 actual: report_size,
-            }
-            .into());
+            });
         }
 
         for attempt in 1..=max_attempts {
@@ -363,8 +379,7 @@ impl DeviceIo {
 
         Err(DriverError::Timeout {
             attempts: max_attempts,
-        }
-        .into())
+        })
     }
 
     /* Drain all unsolicited HID++ events that were buffered during
