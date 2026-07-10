@@ -191,17 +191,46 @@ impl TryFrom<u32> for ProtocolVersion {
 }
 
 /* ---------------------------------------------------------------------- */
+/* Device quirks                                                          */
+/* ---------------------------------------------------------------------- */
+
+/* Per-device behavioral deviations, parsed once from the device database
+ * entry's Quirks= list when load_profiles runs.  Command writers read these
+ * booleans instead of re-scanning the quirk strings on every report. */
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceQuirks {
+    /* Sensei Raw: monochrome LED (intensity, not RGB), 3-byte button
+     * records, no macro support. */
+    is_senseiraw: bool,
+    /* Rival 100: different V1 LED color opcode with a fixed led id of 0. */
+    is_rival100: bool,
+}
+
+impl DeviceQuirks {
+    fn from_config(config: &crate::engine::device_database::DriverConfig) -> Self {
+        let has = |name: &str| config.quirks.iter().any(|q| q == name);
+        Self {
+            is_senseiraw: has("STEELSERIES_QUIRK_SENSEIRAW"),
+            is_rival100: has("STEELSERIES_QUIRK_RIVAL100"),
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------- */
 /* Driver Instance                                                        */
 /* ---------------------------------------------------------------------- */
 
 pub struct SteelseriesDriver {
     /* None until load_profiles has parsed the device database entry. */
     version: Option<ProtocolVersion>,
+    /* Parsed alongside `version`; only read from paths that already run
+     * behind the version() initialization guard. */
+    quirks: DeviceQuirks,
 }
 
 impl SteelseriesDriver {
     pub fn new() -> Self {
-        Self { version: None }
+        Self { version: None, quirks: DeviceQuirks::default() }
     }
 
     /* The parsed protocol version.  Every command path runs after
@@ -212,22 +241,6 @@ impl SteelseriesDriver {
             anyhow!("SteelSeries: driver used before load_profiles initialized the protocol version")
         })
     }
-}
-
-/* ---------------------------------------------------------------------- */
-/* Quirk helpers                                                          */
-/* ---------------------------------------------------------------------- */
-
-fn is_quirk(info: &DeviceInfo, name: &str) -> bool {
-    info.driver_config.quirks.iter().any(|q| q == name)
-}
-
-fn is_senseiraw(info: &DeviceInfo) -> bool {
-    is_quirk(info, "STEELSERIES_QUIRK_SENSEIRAW")
-}
-
-fn is_rival100(info: &DeviceInfo) -> bool {
-    is_quirk(info, "STEELSERIES_QUIRK_RIVAL100")
 }
 
 /* Resolve the DPI step from the driver config.  Most SteelSeries devices
@@ -265,10 +278,11 @@ impl DeviceDriver for SteelseriesDriver {
         })?;
         let version = ProtocolVersion::try_from(raw)?;
         self.version = Some(version);
+        self.quirks = DeviceQuirks::from_config(&info.driver_config);
 
-        let button_count = info.driver_config.buttons.unwrap_or(0) as u32;
-        let led_count = info.driver_config.leds.unwrap_or(0) as u32;
-        let senseiraw = is_senseiraw(info);
+        let button_count = info.driver_config.buttons.unwrap_or(0);
+        let led_count = info.driver_config.leds.unwrap_or(0);
+        let senseiraw = self.quirks.is_senseiraw;
 
         /* Build the DPI list from the range specification if available. */
         let dpi_list: Vec<u32> = info
@@ -353,7 +367,7 @@ impl DeviceDriver for SteelseriesDriver {
         self.write_buttons(io, profile, info).await?;
 
         for led in &profile.leds {
-            self.write_led(io, led, info).await?;
+            self.write_led(io, led).await?;
         }
 
         self.write_report_rate(io, profile.report_rate).await?;
@@ -573,7 +587,7 @@ impl SteelseriesDriver {
             return Ok(());
         }
 
-        let senseiraw = is_senseiraw(info);
+        let senseiraw = self.quirks.is_senseiraw;
         let button_size = if senseiraw {
             STEELSERIES_BUTTON_SIZE_SENSEIRAW
         } else {
@@ -644,9 +658,9 @@ impl SteelseriesDriver {
     /* LEDs                                                                */
     /* ------------------------------------------------------------------ */
 
-    async fn write_led(&self, io: &mut DeviceIo, led: &LedInfo, info: &DeviceInfo) -> Result<()> {
+    async fn write_led(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
         match self.version()? {
-            ProtocolVersion::V1 => self.write_led_v1(io, led, info).await,
+            ProtocolVersion::V1 => self.write_led_v1(io, led).await,
             ProtocolVersion::V2 => self.write_led_v2(io, led).await,
             ProtocolVersion::V3 => self.write_led_v3(io, led).await,
             /* No V4 LED command exists in the protocol (C driver parity);
@@ -658,9 +672,9 @@ impl SteelseriesDriver {
 
     /* V1: a separate effect report followed by a color/intensity report.
      * Rival100 and SenseiRaw both deviate (color opcode / monochrome). */
-    async fn write_led_v1(&self, io: &mut DeviceIo, led: &LedInfo, info: &DeviceInfo) -> Result<()> {
-        let rival100 = is_rival100(info);
-        let senseiraw = is_senseiraw(info);
+    async fn write_led_v1(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
+        let rival100 = self.quirks.is_rival100;
+        let senseiraw = self.quirks.is_senseiraw;
 
         let effect = match led.mode {
             LedMode::Off | LedMode::Solid => 0x01,
@@ -1029,7 +1043,7 @@ mod tests {
     use crate::engine::device_database::{DeviceEntry, DpiRange, DriverConfig};
     use crate::hal::mock::MockExchange;
 
-    fn make_info(device_version: Option<u32>) -> DeviceInfo {
+    fn make_info(device_version: Option<u32>, quirks: &[&str]) -> DeviceInfo {
         let entry = DeviceEntry {
             name: "Test Mouse".into(),
             driver: "steelseries".into(),
@@ -1040,6 +1054,7 @@ mod tests {
                 leds: Some(1),
                 device_version,
                 dpi_range: Some(DpiRange { min: 100, max: 12000, step: 100 }),
+                quirks: quirks.iter().map(|s| s.to_string()).collect(),
                 ..DriverConfig::default()
             }),
         };
@@ -1063,7 +1078,7 @@ mod tests {
     #[tokio::test]
     async fn load_profiles_rejects_missing_device_version() {
         let (mut io, handle) = DeviceIo::with_mock(Vec::new());
-        let mut info = make_info(None);
+        let mut info = make_info(None, &[]);
         let mut drv = SteelseriesDriver::new();
 
         let err = drv.load_profiles(&mut io, &mut info).await.unwrap_err();
@@ -1075,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn load_profiles_rejects_invalid_device_version() {
         let (mut io, handle) = DeviceIo::with_mock(Vec::new());
-        let mut info = make_info(Some(7));
+        let mut info = make_info(Some(7), &[]);
         let mut drv = SteelseriesDriver::new();
 
         let err = drv.load_profiles(&mut io, &mut info).await.unwrap_err();
@@ -1094,7 +1109,7 @@ mod tests {
             fw_request.bytes().to_vec(),
             vec![0x02, 0x01], /* minor, major -> "1.2" */
         )]);
-        let mut info = make_info(Some(1));
+        let mut info = make_info(Some(1), &[]);
         let mut drv = SteelseriesDriver::new();
 
         drv.load_profiles(&mut io, &mut info).await.unwrap();
@@ -1112,5 +1127,55 @@ mod tests {
             vec![LedMode::Off, LedMode::Solid, LedMode::Breathing]
         );
         assert!(handle.script_exhausted());
+        /* No quirk strings configured -> both flags off. */
+        assert_eq!(drv.quirks, DeviceQuirks::default());
+    }
+
+    #[test]
+    fn device_quirks_parse_from_config() {
+        let quirks = |strings: &[&str]| {
+            DeviceQuirks::from_config(&DriverConfig {
+                quirks: strings.iter().map(|s| s.to_string()).collect(),
+                ..DriverConfig::default()
+            })
+        };
+
+        assert_eq!(quirks(&[]), DeviceQuirks::default());
+        assert_eq!(
+            quirks(&["STEELSERIES_QUIRK_SENSEIRAW"]),
+            DeviceQuirks { is_senseiraw: true, is_rival100: false }
+        );
+        assert_eq!(
+            quirks(&["STEELSERIES_QUIRK_RIVAL100", "STEELSERIES_QUIRK_SENSEIRAW"]),
+            DeviceQuirks { is_senseiraw: true, is_rival100: true }
+        );
+        /* Unknown quirk strings are ignored, not misparsed. */
+        assert_eq!(quirks(&["SOME_OTHER_QUIRK"]), DeviceQuirks::default());
+    }
+
+    /* Quirks are parsed exactly once during load_profiles and shape the
+     * seeded state (SenseiRaw: monochrome LED, no Macro action type). */
+    #[tokio::test]
+    async fn load_profiles_persists_quirks_in_driver_state() {
+        let fw_request =
+            Report::output(STEELSERIES_ID_FIRMWARE_PROTOCOL1, STEELSERIES_REPORT_SIZE_SHORT);
+        let (mut io, _handle) = DeviceIo::with_mock(vec![MockExchange::expect_reply(
+            fw_request.bytes().to_vec(),
+            vec![0x00, 0x01],
+        )]);
+        let mut info = make_info(Some(1), &["STEELSERIES_QUIRK_SENSEIRAW"]);
+        let mut drv = SteelseriesDriver::new();
+
+        drv.load_profiles(&mut io, &mut info).await.unwrap();
+
+        assert!(drv.quirks.is_senseiraw);
+        assert!(!drv.quirks.is_rival100);
+
+        let profile = &info.profiles[0];
+        assert_eq!(profile.leds[0].color_depth, 1, "SenseiRaw LED is monochrome");
+        assert!(
+            !profile.buttons[0].action_types.contains(&(ActionType::Macro as u32)),
+            "SenseiRaw buttons must not advertise Macro"
+        );
     }
 }
