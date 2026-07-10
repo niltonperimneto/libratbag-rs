@@ -101,6 +101,13 @@ const EEPROM_LED_OFFSET: usize = 208;
 const EEPROM_LED_SIZE: usize = 11;
 const EEPROM_LED_COUNT: usize = 2;
 
+/* Minimum sector length that fits every slot `EepromProfile` manages.  The
+ * LED region ends last (208 + 2 × 11 = 230); the CRC trailer is owned by
+ * the caller and sits beyond this, so real sectors (typically 256 bytes)
+ * always satisfy it.  Anything shorter is a truncated read and must be
+ * rejected rather than decoded into a partial profile. */
+const EEPROM_PROFILE_MIN_LEN: usize = EEPROM_LED_OFFSET + EEPROM_LED_COUNT * EEPROM_LED_SIZE;
+
 /* ---------------------------------------------------------------------- */
 /* Driver error topology                                                  */
 /* ---------------------------------------------------------------------- */
@@ -322,8 +329,10 @@ impl Hidpp20ButtonBinding {
  *   [208..]    LEDs, 11 bytes each (`EEPROM_LED_COUNT` entries)
  *   [len-2..]  CCITT CRC, big-endian — owned by the caller, not this struct
  *
- * The vectors hold only the slots that physically fit in the sector, matching
- * the bounds checks on both read and write paths. */
+ * Both codecs are all-or-nothing: a buffer shorter than
+ * `EEPROM_PROFILE_MIN_LEN` is rejected with `BufferUnderflow` up front, so a
+ * decoded profile always carries every slot and a serialized one never
+ * silently drops fields. */
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct EepromProfile {
     report_interval: u8,
@@ -334,77 +343,81 @@ struct EepromProfile {
 }
 
 impl EepromProfile {
-    /* Decode the typed slots out of a sector buffer.  `button_count` is the
-     * device's hardware button count (capped at `EEPROM_MAX_BUTTONS`). */
-    fn from_bytes(data: &[u8], button_count: usize) -> Self {
-        let report_interval = data.get(EEPROM_REPORT_INTERVAL_OFFSET).copied().unwrap_or(0);
-        let default_dpi_index = data.get(EEPROM_DEFAULT_DPI_OFFSET).copied().unwrap_or(0);
-
-        let mut dpis = Vec::new();
-        for i in 0..EEPROM_DPI_COUNT {
-            let off = EEPROM_DPI_OFFSET + i * 2;
-            if off + 2 <= data.len() {
-                dpis.push(u16::from_le_bytes([data[off], data[off + 1]]));
-            }
+    /* Reject buffers that cannot hold the full managed layout. */
+    fn check_layout(len: usize) -> Result<(), HidppDriverError> {
+        if len < EEPROM_PROFILE_MIN_LEN {
+            return Err(HidppDriverError::BufferUnderflow {
+                expected: EEPROM_PROFILE_MIN_LEN,
+                received: len,
+            });
         }
+        Ok(())
+    }
 
-        let mut buttons = Vec::new();
-        for b in 0..button_count.min(EEPROM_MAX_BUTTONS) {
-            let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
-            if off + EEPROM_BUTTON_SIZE <= data.len() {
+    /* Decode the typed slots out of a sector buffer.  `button_count` is the
+     * device's hardware button count (capped at `EEPROM_MAX_BUTTONS`).
+     * Fails with `BufferUnderflow` instead of decoding a partial profile. */
+    fn from_bytes(data: &[u8], button_count: usize) -> Result<Self, HidppDriverError> {
+        Self::check_layout(data.len())?;
+
+        let report_interval = data[EEPROM_REPORT_INTERVAL_OFFSET];
+        let default_dpi_index = data[EEPROM_DEFAULT_DPI_OFFSET];
+
+        let dpis = (0..EEPROM_DPI_COUNT)
+            .map(|i| {
+                let off = EEPROM_DPI_OFFSET + i * 2;
+                u16::from_le_bytes([data[off], data[off + 1]])
+            })
+            .collect();
+
+        let buttons = (0..button_count.min(EEPROM_MAX_BUTTONS))
+            .map(|b| {
+                let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
                 let mut bytes = [0u8; EEPROM_BUTTON_SIZE];
                 bytes.copy_from_slice(&data[off..off + EEPROM_BUTTON_SIZE]);
-                buttons.push(Hidpp20ButtonBinding::from_bytes(&bytes));
-            }
-        }
+                Hidpp20ButtonBinding::from_bytes(&bytes)
+            })
+            .collect();
 
-        let mut leds = Vec::new();
-        for l in 0..EEPROM_LED_COUNT {
-            let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
-            if off + EEPROM_LED_SIZE <= data.len() {
+        let leds = (0..EEPROM_LED_COUNT)
+            .map(|l| {
+                let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
                 let mut bytes = [0u8; EEPROM_LED_SIZE];
                 bytes.copy_from_slice(&data[off..off + EEPROM_LED_SIZE]);
-                leds.push(bytes);
-            }
-        }
+                bytes
+            })
+            .collect();
 
-        Self {
+        Ok(Self {
             report_interval,
             default_dpi_index,
             dpis,
             buttons,
             leds,
-        }
+        })
     }
 
     /* Write the owned fields back into `data` at their sector offsets, leaving
-     * all other bytes (and the trailing CRC) untouched.  Slots that would
-     * overflow `data` are skipped, mirroring `from_bytes`. */
-    fn write_into(&self, data: &mut [u8]) {
-        if let Some(b) = data.get_mut(EEPROM_REPORT_INTERVAL_OFFSET) {
-            *b = self.report_interval;
-        }
-        if let Some(b) = data.get_mut(EEPROM_DEFAULT_DPI_OFFSET) {
-            *b = self.default_dpi_index;
-        }
+     * all other bytes (and the trailing CRC) untouched.  Fails with
+     * `BufferUnderflow` instead of skipping slots that would overflow. */
+    fn write_into(&self, data: &mut [u8]) -> Result<(), HidppDriverError> {
+        Self::check_layout(data.len())?;
+
+        data[EEPROM_REPORT_INTERVAL_OFFSET] = self.report_interval;
+        data[EEPROM_DEFAULT_DPI_OFFSET] = self.default_dpi_index;
         for (i, &dpi) in self.dpis.iter().enumerate().take(EEPROM_DPI_COUNT) {
             let off = EEPROM_DPI_OFFSET + i * 2;
-            if off + 2 <= data.len() {
-                data[off..off + 2].copy_from_slice(&dpi.to_le_bytes());
-            }
+            data[off..off + 2].copy_from_slice(&dpi.to_le_bytes());
         }
         for (b, binding) in self.buttons.iter().enumerate().take(EEPROM_MAX_BUTTONS) {
             let off = EEPROM_BUTTON_OFFSET + b * EEPROM_BUTTON_SIZE;
-            if off + EEPROM_BUTTON_SIZE <= data.len() {
-                data[off..off + EEPROM_BUTTON_SIZE].copy_from_slice(&binding.into_bytes());
-            }
+            data[off..off + EEPROM_BUTTON_SIZE].copy_from_slice(&binding.into_bytes());
         }
         for (l, led) in self.leds.iter().enumerate().take(EEPROM_LED_COUNT) {
             let off = EEPROM_LED_OFFSET + l * EEPROM_LED_SIZE;
-            if off + EEPROM_LED_SIZE <= data.len() {
-                data[off..off + EEPROM_LED_SIZE].copy_from_slice(led);
-            }
+            data[off..off + EEPROM_LED_SIZE].copy_from_slice(led);
         }
+        Ok(())
     }
 }
 
@@ -853,30 +866,29 @@ impl Hidpp20Driver {
 
     /* Verify the CRC-CCITT checksum stored in the last two bytes (big-endian)
      * of a sector buffer, matching the C hidpp20_onboard_profiles_is_sector_valid.
-     * Returns true when the CRC matches; logs a warning when it does not.
-     * A mismatch is non-fatal — callers log it and continue with the data,
-     * the same behaviour the legacy C driver exhibited. */
-    fn verify_sector_crc(sector: u16, data: &[u8]) -> bool {
+     *
+     * Returns `CrcMismatch` (or `BufferUnderflow` for a sector too short to
+     * even hold the trailer) so callers can drive the ROM-fallback/repair
+     * recovery from the typed error rather than a bare bool. */
+    fn verify_sector_crc(sector: u16, data: &[u8]) -> Result<(), HidppDriverError> {
         if data.len() < 2 {
-            warn!(
-                "HID++ 2.0: sector 0x{sector:04X}: too short to validate CRC ({} bytes)",
-                data.len()
-            );
-            return false;
+            return Err(HidppDriverError::BufferUnderflow {
+                expected: 2,
+                received: data.len(),
+            });
         }
         let crc_offset = data.len() - 2;
         let computed = hidpp::compute_ccitt_crc(&data[..crc_offset]);
         let stored = u16::from_be_bytes([data[crc_offset], data[crc_offset + 1]]);
         if computed != stored {
-            warn!(
-                "HID++ 2.0: sector 0x{sector:04X}: CRC mismatch \
-                 (stored 0x{stored:04X}, computed 0x{computed:04X})"
-            );
-            false
-        } else {
-            debug!("HID++ 2.0: sector 0x{sector:04X}: CRC OK (0x{stored:04X})");
-            true
+            return Err(HidppDriverError::CrcMismatch {
+                sector,
+                expected: computed,
+                received: stored,
+            });
         }
+        debug!("HID++ 2.0: sector 0x{sector:04X}: CRC OK (0x{stored:04X})");
+        Ok(())
     }
 
     async fn read_sector(
@@ -1541,14 +1553,17 @@ impl super::DeviceDriver for Hidpp20Driver {
                 .await
             {
                 Ok(data) => {
-                    let crc_ok = Self::verify_sector_crc(USER_PROFILES_BASE, &data);
-                    if !crc_ok {
-                        self.needs_eeprom_repair = true;
-                        warn!(
-                            "HID++ 2.0: profile dictionary CRC invalid; \
-                             will read ROM profiles instead of corrupted EEPROM"
-                        );
-                    }
+                    let crc_ok = match Self::verify_sector_crc(USER_PROFILES_BASE, &data) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.needs_eeprom_repair = true;
+                            warn!(
+                                "HID++ 2.0: profile dictionary invalid ({e}); \
+                                 will read ROM profiles instead of corrupted EEPROM"
+                            );
+                            false
+                        }
+                    };
                     (Some(data), crc_ok)
                 }
                 Err(e) => {
@@ -1631,18 +1646,17 @@ impl super::DeviceDriver for Hidpp20Driver {
 
                 if !use_rom {
                     match self.read_sector(io, idx, addr, 0, sector_size).await {
-                        Ok(data) => {
-                            if Self::verify_sector_crc(addr, &data) {
-                                profile_data = data;
-                            } else {
+                        Ok(data) => match Self::verify_sector_crc(addr, &data) {
+                            Ok(()) => profile_data = data,
+                            Err(e) => {
                                 self.needs_eeprom_repair = true;
                                 warn!(
-                                    "HID++ 2.0: profile {i} sector 0x{addr:04X} has bad CRC; \
+                                    "HID++ 2.0: profile {i} sector 0x{addr:04X} invalid ({e}); \
                                      falling back to ROM"
                                 );
                                 use_rom = true;
                             }
-                        }
+                        },
                         Err(e) => {
                             warn!(
                                 "HID++ 2.0: failed to read profile sector 0x{addr:04X}: {e}; \
@@ -1672,10 +1686,26 @@ impl super::DeviceDriver for Hidpp20Driver {
                     }
                 }
 
+                /* Strict decode: a sector that cannot hold the full layout is
+                 * rejected rather than parsed into a partial profile.  Since
+                 * read_sector returns exactly sector_size bytes, an underflow
+                 * here means the descriptor's sector size is too small for
+                 * the profile layout — a ROM re-read would fail identically,
+                 * so the profile is skipped.  User-sourced data additionally
+                 * flags an EEPROM repair for the next commit. */
+                let eeprom = match EepromProfile::from_bytes(&profile_data, button_count) {
+                    Ok(eeprom) => eeprom,
+                    Err(e) => {
+                        if !use_rom {
+                            self.needs_eeprom_repair = true;
+                        }
+                        warn!("HID++ 2.0: profile {i} sector undecodable ({e}); skipping");
+                        continue;
+                    }
+                };
+
                 let p = &mut info.profiles[i];
                 p.is_enabled = enabled;
-
-                let eeprom = EepromProfile::from_bytes(&profile_data, button_count);
 
                 /* --- Report rate (byte 0): stored as ms-interval, convert to Hz --- */
                 if eeprom.report_interval > 0 {
@@ -2039,9 +2069,23 @@ impl super::DeviceDriver for Hidpp20Driver {
                     /* Decode the read-back sector, patch the fields ratbag
                      * manages, then write them back.  Starting from the
                      * existing bytes preserves every slot we don't touch
-                     * (and any device-private fields between them). */
+                     * (and any device-private fields between them).
+                     *
+                     * An underflow means the descriptor's sector_size cannot
+                     * hold the profile layout — writing anything would corrupt
+                     * the sector, so abort this profile and surface the error. */
                     let mut eeprom =
-                        EepromProfile::from_bytes(&profile_data, desc.button_count as usize);
+                        match EepromProfile::from_bytes(&profile_data, desc.button_count as usize) {
+                            Ok(eeprom) => eeprom,
+                            Err(e) => {
+                                warn!(
+                                    "HID++ 2.0: cannot decode sector 0x{addr:04X} for profile {}: {e}",
+                                    profile.index
+                                );
+                                last_err = Some(e);
+                                continue;
+                            }
+                        };
 
                     /* 1. Report rate (byte 0): Hz → ms-interval. */
                     if profile.report_rate > 0 {
@@ -2082,7 +2126,14 @@ impl super::DeviceDriver for Hidpp20Driver {
                         }
                     }
 
-                    eeprom.write_into(&mut profile_data);
+                    if let Err(e) = eeprom.write_into(&mut profile_data) {
+                        warn!(
+                            "HID++ 2.0: cannot serialize profile {} into sector 0x{addr:04X}: {e}",
+                            profile.index
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
 
                     /* 6. Recompute CRC (last 2 bytes, BE) */
                     let crc_offset = profile_data.len() - 2;
@@ -2364,7 +2415,7 @@ mod tests {
 
     #[test]
     fn eeprom_profile_decodes_each_field() {
-        let eeprom = EepromProfile::from_bytes(&sample_sector(), 8);
+        let eeprom = EepromProfile::from_bytes(&sample_sector(), 8).unwrap();
         assert_eq!(eeprom.report_interval, 1);
         assert_eq!(eeprom.default_dpi_index, 2);
         assert_eq!(eeprom.dpis, vec![400, 800, 1600, 0, 0xFFFF]);
@@ -2377,32 +2428,112 @@ mod tests {
     #[test]
     fn eeprom_profile_round_trips() {
         let original = sample_sector();
-        let eeprom = EepromProfile::from_bytes(&original, 8);
+        let eeprom = EepromProfile::from_bytes(&original, 8).unwrap();
 
         /* Writing the decoded fields back onto the same buffer is a no-op. */
         let mut rewritten = original.clone();
-        eeprom.write_into(&mut rewritten);
+        eeprom.write_into(&mut rewritten).unwrap();
         assert_eq!(rewritten, original, "read→write must not change managed bytes");
 
         /* Writing onto a blank buffer and re-decoding yields the same record. */
         let mut blank = vec![0u8; 256];
-        eeprom.write_into(&mut blank);
-        assert_eq!(EepromProfile::from_bytes(&blank, 8), eeprom);
+        eeprom.write_into(&mut blank).unwrap();
+        assert_eq!(EepromProfile::from_bytes(&blank, 8).unwrap(), eeprom);
     }
 
     #[test]
     fn eeprom_profile_preserves_unmanaged_bytes() {
         let mut data = sample_sector();
-        let eeprom = EepromProfile::from_bytes(&data, 8);
+        let eeprom = EepromProfile::from_bytes(&data, 8).unwrap();
         /* Scribble the managed slots with a different record's bytes, then
          * restore: the sentinels in the gaps and CRC trailer stay put. */
         let other = EepromProfile::default();
-        other.write_into(&mut data);
-        eeprom.write_into(&mut data);
+        other.write_into(&mut data).unwrap();
+        eeprom.write_into(&mut data).unwrap();
         assert_eq!(data[13], 0x5A);
         assert_eq!(data[31], 0xC3);
         assert_eq!(data[200], 0x99);
         assert_eq!(data[254], 0xDE);
         assert_eq!(data[255], 0xAD);
+    }
+
+    #[test]
+    fn eeprom_profile_rejects_short_buffer_on_decode() {
+        /* One byte short of the layout: decoding must fail whole, not
+         * produce a profile with a truncated LED list. */
+        let data = vec![0u8; EEPROM_PROFILE_MIN_LEN - 1];
+        let err = EepromProfile::from_bytes(&data, 8).unwrap_err();
+        match err {
+            HidppDriverError::BufferUnderflow { expected, received } => {
+                assert_eq!(expected, EEPROM_PROFILE_MIN_LEN);
+                assert_eq!(received, EEPROM_PROFILE_MIN_LEN - 1);
+            }
+            other => panic!("expected BufferUnderflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eeprom_profile_rejects_short_buffer_on_write() {
+        let eeprom = EepromProfile::from_bytes(&sample_sector(), 8).unwrap();
+        let mut short = vec![0u8; EEPROM_LED_OFFSET]; /* LEDs would overflow */
+        let err = eeprom.write_into(&mut short).unwrap_err();
+        match err {
+            HidppDriverError::BufferUnderflow { expected, received } => {
+                assert_eq!(expected, EEPROM_PROFILE_MIN_LEN);
+                assert_eq!(received, EEPROM_LED_OFFSET);
+            }
+            other => panic!("expected BufferUnderflow, got {other:?}"),
+        }
+        /* Nothing may have been written before the failure. */
+        assert!(short.iter().all(|&b| b == 0), "failed write must not mutate");
+    }
+
+    #[test]
+    fn eeprom_profile_accepts_exact_min_length() {
+        let mut data = sample_sector();
+        data.truncate(EEPROM_PROFILE_MIN_LEN);
+        let eeprom = EepromProfile::from_bytes(&data, 8).unwrap();
+        assert_eq!(eeprom.leds.len(), EEPROM_LED_COUNT);
+        eeprom.write_into(&mut data).unwrap();
+    }
+
+    #[test]
+    fn verify_sector_crc_reports_mismatch_fields() {
+        let mut data = sample_sector();
+        let crc_offset = data.len() - 2;
+        let computed = hidpp::compute_ccitt_crc(&data[..crc_offset]);
+        /* Store a deliberately wrong CRC. */
+        let wrong = computed.wrapping_add(1);
+        data[crc_offset..].copy_from_slice(&wrong.to_be_bytes());
+
+        let err = Hidpp20Driver::verify_sector_crc(0x0102, &data).unwrap_err();
+        match err {
+            HidppDriverError::CrcMismatch {
+                sector,
+                expected,
+                received,
+            } => {
+                assert_eq!(sector, 0x0102);
+                assert_eq!(expected, computed);
+                assert_eq!(received, wrong);
+            }
+            other => panic!("expected CrcMismatch, got {other:?}"),
+        }
+
+        /* Restoring the correct CRC makes verification pass. */
+        data[crc_offset..].copy_from_slice(&computed.to_be_bytes());
+        Hidpp20Driver::verify_sector_crc(0x0102, &data).unwrap();
+    }
+
+    #[test]
+    fn verify_sector_crc_rejects_tiny_buffer() {
+        let err = Hidpp20Driver::verify_sector_crc(0x0001, &[0xFF]).unwrap_err();
+        assert!(matches!(
+            err,
+            HidppDriverError::BufferUnderflow {
+                expected: 2,
+                received: 1
+            }
+        ));
     }
 }
