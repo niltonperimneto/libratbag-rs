@@ -191,6 +191,23 @@ impl FeatureMap {
             _ => {}
         }
     }
+
+    /* Return the runtime index for a feature page, or `UnsupportedFeature`
+     * if the device did not advertise it.  Operations that *demand* a
+     * capability go through here so a missing feature surfaces as a typed
+     * error instead of a silent no-op. */
+    fn require(&self, page: u16) -> Result<u8, HidppDriverError> {
+        let index = match page {
+            PAGE_ADJUSTABLE_DPI => self.adjustable_dpi,
+            PAGE_SPECIAL_KEYS_BUTTONS => self.special_keys,
+            PAGE_ONBOARD_PROFILES => self.onboard_profiles,
+            PAGE_COLOR_LED_EFFECTS => self.color_led_effects,
+            PAGE_RGB_EFFECTS => self.rgb_effects,
+            PAGE_ADJUSTABLE_REPORT_RATE => self.report_rate,
+            _ => None,
+        };
+        index.ok_or(HidppDriverError::UnsupportedFeature(page))
+    }
 }
 
 /* HID++ 2.0 Button Binding representation (4 bytes) */
@@ -979,10 +996,12 @@ impl Hidpp20Driver {
     }
 
     /* Read DPI sensor information using feature 0x2201. */
-    async fn read_dpi_info(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
-        let Some(idx) = self.features.adjustable_dpi else {
-            return Ok(());
-        };
+    async fn read_dpi_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &mut ProfileInfo,
+    ) -> Result<(), HidppDriverError> {
+        let idx = self.features.require(PAGE_ADJUSTABLE_DPI)?;
 
         let list_data = self
             .feature_request(io, idx, DPI_FN_GET_SENSOR_DPI_LIST, &[0])
@@ -1022,10 +1041,8 @@ impl Hidpp20Driver {
         &mut self,
         io: &mut DeviceIo,
         profile: &mut ProfileInfo,
-    ) -> Result<()> {
-        let Some(idx) = self.features.report_rate else {
-            return Ok(());
-        };
+    ) -> Result<(), HidppDriverError> {
+        let idx = self.features.require(PAGE_ADJUSTABLE_REPORT_RATE)?;
 
         let list_data = self
             .feature_request(io, idx, RATE_FN_GET_REPORT_RATE_LIST, &[])
@@ -1049,10 +1066,12 @@ impl Hidpp20Driver {
     }
 
     /* Read LED zone effect from the device using feature 0x8070. */
-    async fn read_led_info(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
-        let Some(idx) = self.features.color_led_effects else {
-            return Ok(());
-        };
+    async fn read_led_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &mut ProfileInfo,
+    ) -> Result<(), HidppDriverError> {
+        let idx = self.features.require(PAGE_COLOR_LED_EFFECTS)?;
 
         for led in &mut profile.leds {
             let zone_index = led.index as u8;
@@ -1076,16 +1095,17 @@ impl Hidpp20Driver {
 
     /* Write LED zone effect to the device using feature 0x8070. */
     /* TriColor mode is routed through feature 0x8071 (RGB Effects) instead. */
-    async fn write_led_info(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
+    async fn write_led_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &ProfileInfo,
+    ) -> Result<(), HidppDriverError> {
         for led in &profile.leds {
             let zone_index = led.index as u8;
 
             if led.mode == LedMode::TriColor {
                 /* TriColor uses 0x8071 RGB Effects with the multi-LED cluster pattern command. */
-                let Some(idx) = self.features.rgb_effects else {
-                    warn!("TriColor requested but device lacks RGB Effects (0x8071)");
-                    continue;
-                };
+                let idx = self.features.require(PAGE_RGB_EFFECTS)?;
                 let led_payload = hidpp::build_led_payload(led);
                 let mut bytes = [0u8; 16];
                 bytes[0] = zone_index;
@@ -1094,10 +1114,7 @@ impl Hidpp20Driver {
                 /* Function 0x02 = setMultiLEDRGBClusterPattern on 0x8071. Note: C passes 13 bytes */
                 self.feature_request(io, idx, 0x02, &bytes[0..13]).await?;
             } else {
-                let Some(idx) = self.features.color_led_effects else {
-                    warn!("Device lacks Color LED Effects (0x8070)");
-                    continue;
-                };
+                let idx = self.features.require(PAGE_COLOR_LED_EFFECTS)?;
                 let led_payload = hidpp::build_led_payload(led);
                 let mut bytes = [0u8; 16];
                 bytes[0] = zone_index;
@@ -1117,14 +1134,16 @@ impl Hidpp20Driver {
     }
 
     /* Write DPI sensor information using feature 0x2201. */
-    async fn write_dpi_info(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
-        let Some(idx) = self.features.adjustable_dpi else {
-            return Ok(());
-        };
-
+    async fn write_dpi_info(
+        &self,
+        io: &mut DeviceIo,
+        profile: &ProfileInfo,
+    ) -> Result<(), HidppDriverError> {
         if let Some(res) = profile.resolutions.iter().find(|r| r.is_active)
             && let Dpi::Unified(dpi_val) = res.dpi
         {
+            /* An active resolution demands the Adjustable DPI feature. */
+            let idx = self.features.require(PAGE_ADJUSTABLE_DPI)?;
             let dpi_u16 = dpi_val.min(u32::from(u16::MAX)) as u16;
             let [hi, lo] = dpi_u16.to_be_bytes();
             /* setSensorDPI is fn=3; only sensor_index + dpi_hi + dpi_lo are needed */
@@ -1141,12 +1160,12 @@ impl Hidpp20Driver {
     }
 
     /* Write report rate using feature 0x8060. */
-    async fn write_report_rate(&self, io: &mut DeviceIo, profile: &ProfileInfo) -> Result<()> {
+    async fn write_report_rate(
+        &self,
+        io: &mut DeviceIo,
+        profile: &ProfileInfo,
+    ) -> Result<(), HidppDriverError> {
         const RATE_FN_SET_REPORT_RATE: u8 = 0x02;
-
-        let Some(idx) = self.features.report_rate else {
-            return Ok(());
-        };
 
         if profile.report_rate > 0 {
             /* Some firmware returns INVALID_ARGUMENT when asked to set the
@@ -1158,6 +1177,8 @@ impl Hidpp20Driver {
                 );
                 return Ok(());
             }
+            /* A rate change demands the Adjustable Report Rate feature. */
+            let idx = self.features.require(PAGE_ADJUSTABLE_REPORT_RATE)?;
             /* Clamp the ms-interval to u8 range; realistic rates (125–8000 Hz)
              * always produce values 1–8 so this is purely defensive. */
             let rate_ms = (1000 / profile.report_rate).min(u32::from(u8::MAX)) as u8;
@@ -1856,18 +1877,29 @@ impl super::DeviceDriver for Hidpp20Driver {
             /* Fallback: no onboard profiles — read everything from live
              * feature requests.  This only works for the single default
              * profile since live features reflect hardware state, not
-             * stored profile state. */
+             * stored profile state.
+             *
+             * These reads are opportunistic: a device that simply lacks an
+             * optional feature is not an error here, so each read is gated
+             * on feature presence.  Mid-read failures on a feature the
+             * device *does* advertise are still logged. */
             for profile in &mut info.profiles {
-                if let Err(e) = self.read_dpi_info(io, profile).await {
+                if self.features.adjustable_dpi.is_some()
+                    && let Err(e) = self.read_dpi_info(io, profile).await
+                {
                     warn!("Failed to read DPI for profile {}: {e}", profile.index);
                 }
-                if let Err(e) = self.read_report_rate(io, profile).await {
+                if self.features.report_rate.is_some()
+                    && let Err(e) = self.read_report_rate(io, profile).await
+                {
                     warn!(
                         "Failed to read report rate for profile {}: {e}",
                         profile.index
                     );
                 }
-                if let Err(e) = self.read_led_info(io, profile).await {
+                if self.features.color_led_effects.is_some()
+                    && let Err(e) = self.read_led_info(io, profile).await
+                {
                     warn!("Failed to read LEDs for profile {}: {e}", profile.index);
                 }
             }
@@ -1887,20 +1919,31 @@ impl super::DeviceDriver for Hidpp20Driver {
          *
          * When onboard profiles are ABSENT we are in host-managed mode and
          * the live feature calls are the only way to change settings. */
-        if self.features.onboard_profiles.is_none() {
-            if let Some(profile) = info.profiles.iter().find(|p| p.is_active) {
-                if let Err(e) = self.write_dpi_info(io, profile).await {
-                    warn!("Failed to commit DPI for profile {}: {e:#}", profile.index);
-                }
-                if let Err(e) = self.write_report_rate(io, profile).await {
-                    warn!(
-                        "Failed to commit report rate for profile {}: {e:#}",
-                        profile.index
-                    );
-                }
-                if let Err(e) = self.write_led_info(io, profile).await {
-                    warn!("Failed to commit LEDs for profile {}: {e:#}", profile.index);
-                }
+        if self.features.onboard_profiles.is_none()
+            && let Some(profile) = info.profiles.iter().find(|p| p.is_active)
+        {
+            /* Attempt all three writes so a failure in one does not block
+             * the others, but propagate the first error instead of
+             * swallowing it — the daemon must see that part of the commit
+             * did not reach the hardware (e.g. UnsupportedFeature). */
+            let mut first_err: Option<HidppDriverError> = None;
+            if let Err(e) = self.write_dpi_info(io, profile).await {
+                warn!("Failed to commit DPI for profile {}: {e}", profile.index);
+                first_err.get_or_insert(e);
+            }
+            if let Err(e) = self.write_report_rate(io, profile).await {
+                warn!(
+                    "Failed to commit report rate for profile {}: {e}",
+                    profile.index
+                );
+                first_err.get_or_insert(e);
+            }
+            if let Err(e) = self.write_led_info(io, profile).await {
+                warn!("Failed to commit LEDs for profile {}: {e}", profile.index);
+                first_err.get_or_insert(e);
+            }
+            if let Some(e) = first_err {
+                return Err(e.into());
             }
         }
 
@@ -1924,14 +1967,21 @@ impl super::DeviceDriver for Hidpp20Driver {
                     );
                     self.needs_eeprom_repair = false;
                     if let Some(profile) = info.profiles.iter().find(|p| p.is_active) {
+                        let mut first_err: Option<HidppDriverError> = None;
                         if let Err(e) = self.write_dpi_info(io, profile).await {
-                            warn!("Failed to commit DPI via live write: {e:#}");
+                            warn!("Failed to commit DPI via live write: {e}");
+                            first_err.get_or_insert(e);
                         }
                         if let Err(e) = self.write_report_rate(io, profile).await {
-                            warn!("Failed to commit report rate via live write: {e:#}");
+                            warn!("Failed to commit report rate via live write: {e}");
+                            first_err.get_or_insert(e);
                         }
                         if let Err(e) = self.write_led_info(io, profile).await {
-                            warn!("Failed to commit LEDs via live write: {e:#}");
+                            warn!("Failed to commit LEDs via live write: {e}");
+                            first_err.get_or_insert(e);
+                        }
+                        if let Some(e) = first_err {
+                            return Err(e.into());
                         }
                     }
                     return Ok(());
