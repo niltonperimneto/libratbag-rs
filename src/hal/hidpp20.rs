@@ -4,13 +4,14 @@
 /* Logitech gaming mice. Each capability is exposed as a numbered "feature" */
 /* that must be discovered at probe time via the Root feature (0x0000). */
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
+use thiserror::Error;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, trace, warn};
 
 use crate::engine::device::{Color, DeviceInfo, Dpi, LedMode, ProfileInfo, RgbColor};
-use crate::hal::DeviceIo;
+use crate::hal::{DeviceIo, DriverError};
 
 use super::hidpp::{
     self, BUTTON_SUBTYPE_CONSUMER, BUTTON_SUBTYPE_KEYBOARD, BUTTON_SUBTYPE_MOUSE,
@@ -99,6 +100,72 @@ const EEPROM_MAX_BUTTONS: usize = 16;
 const EEPROM_LED_OFFSET: usize = 208;
 const EEPROM_LED_SIZE: usize = 11;
 const EEPROM_LED_COUNT: usize = 2;
+
+/* ---------------------------------------------------------------------- */
+/* Driver error topology                                                  */
+/* ---------------------------------------------------------------------- */
+
+/* Concrete failure classes for the HID++ 2.0 hardware abstraction.
+ *
+ * Each variant carries enough structure for the daemon (and ultimately the
+ * DBus layer) to select a recovery strategy without parsing message strings:
+ * a `DeviceTimeout` is retryable, an `UnsupportedFeature` is permanent for
+ * this device, and a `CrcMismatch` signals repairable EEPROM corruption. */
+#[derive(Debug, Error)]
+pub enum HidppDriverError {
+    /* Device did not answer within the transport's retry budget. */
+    #[error("HID++ 2.0 device timed out")]
+    DeviceTimeout,
+
+    /* The device answered with a HID++ 2.0 error report (Long 0xFF or
+     * Short 0x8F).  `feature` is the runtime feature index the request
+     * addressed, `function` the function number within it. */
+    #[error(
+        "HID++ 2.0 protocol error {} (0x{code:02X}) for feature 0x{feature:02X} fn={function}",
+        hidpp::hidpp20_error_name(*code)
+    )]
+    ProtocolError { code: u8, feature: u8, function: u8 },
+
+    /* Stored sector CRC (trailing two bytes, big-endian) does not match
+     * the CRC-CCITT computed over the sector body. */
+    #[error(
+        "sector 0x{sector:04X}: CRC mismatch (expected 0x{expected:04X}, received 0x{received:04X})"
+    )]
+    CrcMismatch {
+        sector: u16,
+        expected: u16,
+        received: u16,
+    },
+
+    /* Operation requires a feature page the device did not advertise.
+     * Payload is the feature page ID (e.g. PAGE_ADJUSTABLE_DPI = 0x2201). */
+    #[error("unsupported HID++ 2.0 feature page 0x{0:04X}")]
+    UnsupportedFeature(u16),
+
+    /* Byte slice shorter than the fixed layout requires. */
+    #[error("buffer underflow: expected {expected} bytes, received {received}")]
+    BufferUnderflow { expected: usize, received: usize },
+
+    /* Transport-level failure surfaced by `DeviceIo` (I/O error, ioctl
+     * failure, oversized report request).  `DriverError::Timeout` is
+     * mapped to `DeviceTimeout` in the `From` impl instead of passing
+     * through here. */
+    #[error(transparent)]
+    Transport(DriverError),
+
+    /* Protocol version probe failed at every candidate device index. */
+    #[error("HID++ 2.0 probe failed (tried indices {0:02X?})")]
+    ProbeFailed(Vec<u8>),
+}
+
+impl From<DriverError> for HidppDriverError {
+    fn from(e: DriverError) -> Self {
+        match e {
+            DriverError::Timeout { .. } => Self::DeviceTimeout,
+            other => Self::Transport(other),
+        }
+    }
+}
 
 /* A feature page → runtime index mapping for a known set of capabilities. */
 #[derive(Debug, Default)]
@@ -523,7 +590,11 @@ impl Hidpp20Driver {
 
     /* Query the Root feature (0x0000, fn 0) to find the runtime index of */
     /* a given feature page. Returns `None` if the device does not support it. */
-    async fn get_feature_index(&self, io: &mut DeviceIo, feature_page: u16) -> Result<Option<u8>> {
+    async fn get_feature_index(
+        &self,
+        io: &mut DeviceIo,
+        feature_page: u16,
+    ) -> Result<Option<u8>, HidppDriverError> {
         let [hi, lo] = feature_page.to_be_bytes();
 
         let request = hidpp::build_hidpp20_request(
@@ -535,30 +606,31 @@ impl Hidpp20Driver {
         );
 
         let dev_idx = self.device_index;
-        io.request(&request, 20, 3, move |buf| {
-            let report = HidppReport::parse(buf)?;
+        let index = io
+            .request(&request, 20, 3, move |buf| {
+                let report = HidppReport::parse(buf)?;
 
-            /* An error from the Root feature means the page is not supported. */
-            if report
-                .hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX)
-                .is_some()
-                || report.is_error()
-            {
-                return Some(None);
-            }
+                /* An error from the Root feature means the page is not supported. */
+                if report
+                    .hidpp20_error_code(dev_idx, ROOT_FEATURE_INDEX)
+                    .is_some()
+                    || report.is_error()
+                {
+                    return Some(None);
+                }
 
-            /* Accept both Long and Short responses for the Root feature. */
-            if !report.matches_hidpp20(dev_idx, ROOT_FEATURE_INDEX) {
-                return None;
-            }
-            let index = match &report {
-                HidppReport::Long { params, .. } => params[0],
-                HidppReport::Short { params, .. } => params[0],
-            };
-            Some(if index == 0 { None } else { Some(index) })
-        })
-        .await
-        .with_context(|| format!("Feature lookup for 0x{feature_page:04X} failed"))
+                /* Accept both Long and Short responses for the Root feature. */
+                if !report.matches_hidpp20(dev_idx, ROOT_FEATURE_INDEX) {
+                    return None;
+                }
+                let index = match &report {
+                    HidppReport::Long { params, .. } => params[0],
+                    HidppReport::Short { params, .. } => params[0],
+                };
+                Some(if index == 0 { None } else { Some(index) })
+            })
+            .await?;
+        Ok(index)
     }
 
     /* Send a HID++ 2.0 feature request and return the 16-byte response payload. */
@@ -575,7 +647,7 @@ impl Hidpp20Driver {
         feature_index: u8,
         function: u8,
         params: &[u8],
-    ) -> Result<[u8; 16]> {
+    ) -> Result<[u8; 16], HidppDriverError> {
         let request =
             hidpp::build_hidpp20_request(self.device_index, feature_index, function, SW_ID, params);
 
@@ -625,19 +697,15 @@ impl Hidpp20Driver {
 
                 None
             })
-            .await
-            .with_context(|| {
-                format!("Feature request (idx=0x{feature_index:02X}, fn={function}) failed")
-            })?;
+            .await?;
 
         match resp {
             Resp::Ok(p) => Ok(p),
-            Resp::HidppErr(code) => {
-                let name = hidpp::hidpp20_error_name(code);
-                Err(anyhow::anyhow!(
-                    "HID++ error {name} (0x{code:02X}) for feature 0x{feature_index:02X} fn={function}"
-                ))
-            }
+            Resp::HidppErr(code) => Err(HidppDriverError::ProtocolError {
+                code,
+                feature: feature_index,
+                function,
+            }),
         }
     }
 
@@ -682,7 +750,7 @@ impl Hidpp20Driver {
         feature_index: u8,
         function: u8,
         params: &[u8],
-    ) -> Result<()> {
+    ) -> Result<(), HidppDriverError> {
         let request = hidpp::build_hidpp20_short_request_with_params(
             self.device_index,
             feature_index,
@@ -717,21 +785,15 @@ impl Hidpp20Driver {
                     _ => None,
                 }
             })
-            .await
-            .with_context(|| {
-                format!(
-                    "Short feature request with params (idx=0x{feature_index:02X}, fn={function}) failed"
-                )
-            })?;
+            .await?;
 
         match resp {
             Resp::Ok => Ok(()),
-            Resp::HidppErr(code) => {
-                let name = hidpp::hidpp20_error_name(code);
-                Err(anyhow::anyhow!(
-                    "HID++ error {name} (0x{code:02X}) for feature 0x{feature_index:02X} fn={function}"
-                ))
-            }
+            Resp::HidppErr(code) => Err(HidppDriverError::ProtocolError {
+                code,
+                feature: feature_index,
+                function,
+            }),
         }
     }
 
@@ -807,7 +869,7 @@ impl Hidpp20Driver {
         sector_index: u16,
         read_offset: u16,
         size: u16,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, HidppDriverError> {
         let mut result = Vec::with_capacity(size as usize);
         let mut current_offset = read_offset;
         let end_offset = read_offset + size;
@@ -834,8 +896,7 @@ impl Hidpp20Driver {
 
             let response = self
                 .feature_request(io, idx, PROFILES_FN_MEMORY_READ, &bytes)
-                .await
-                .context("Failed to read sector chunk")?;
+                .await?;
 
             if effective_offset == current_offset {
                 result.extend_from_slice(&response[..chunk_size as usize]);
@@ -856,10 +917,11 @@ impl Hidpp20Driver {
         sector_index: u16,
         write_offset: u16,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<(), HidppDriverError> {
         const WRITE_RETRIES: usize = 3;
 
-        for attempt in 0..WRITE_RETRIES {
+        let mut attempt = 0;
+        loop {
             match self
                 .write_sector_once(io, idx, sector_index, write_offset, data)
                 .await
@@ -874,14 +936,11 @@ impl Hidpp20Driver {
                     /* Some receivers reject rapid successive memWrite bursts;
                      * brief backoff mirrors C driver's retry behaviour. */
                     sleep(Duration::from_millis(15 * (attempt as u64 + 1))).await;
+                    attempt += 1;
                 }
                 Err(e) => return Err(e),
             }
         }
-
-        /* All retries exhausted without error or success — should be unreachable
-         * with WRITE_RETRIES >= 1, but satisfy the type checker. */
-        Ok(())
     }
 
     async fn write_sector_once(
@@ -891,7 +950,7 @@ impl Hidpp20Driver {
         sector_index: u16,
         write_offset: u16,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<(), HidppDriverError> {
         let size = data.len() as u16;
 
         // Step 1: Write Start command
@@ -902,22 +961,19 @@ impl Hidpp20Driver {
 
         // 1. Initiate Write Sequence
         self.feature_request(io, idx, PROFILES_FN_MEMORY_ADDR_WRITE, &start_bytes)
-            .await
-            .context("Failed to start sector write")?;
+            .await?;
 
         // 2. Iterate and Write Data Chunks (16 bytes at a time)
         for chunk in data.chunks(16) {
             let mut payload = [0u8; 16];
             payload[..chunk.len()].copy_from_slice(chunk);
             self.feature_request(io, idx, PROFILES_FN_MEMORY_WRITE, &payload)
-                .await
-                .context("Failed to write sector chunk")?;
+                .await?;
         }
 
         /* 3. Finalize Write — C sends a SHORT report with no parameters. */
         self.short_feature_request_with_params(io, idx, PROFILES_FN_MEMORY_WRITE_END, &[])
-            .await
-            .context("Failed to end sector write")?;
+            .await?;
 
         Ok(())
     }
@@ -1036,9 +1092,7 @@ impl Hidpp20Driver {
                 bytes[1..12].copy_from_slice(&led_payload);
                 bytes[12] = 0x01; /* persist */
                 /* Function 0x02 = setMultiLEDRGBClusterPattern on 0x8071. Note: C passes 13 bytes */
-                self.feature_request(io, idx, 0x02, &bytes[0..13])
-                    .await
-                    .context("Failed to write TriColor multi-LED cluster pattern")?;
+                self.feature_request(io, idx, 0x02, &bytes[0..13]).await?;
             } else {
                 let Some(idx) = self.features.color_led_effects else {
                     warn!("Device lacks Color LED Effects (0x8070)");
@@ -1050,8 +1104,7 @@ impl Hidpp20Driver {
                 bytes[1..12].copy_from_slice(&led_payload);
                 bytes[12] = 0x01; /* persist */
                 self.feature_request(io, idx, LED_FN_SET_ZONE_EFFECT, &bytes[0..13])
-                    .await
-                    .context("Failed to write LED zone effect")?;
+                    .await?;
             }
 
             debug!(
@@ -1077,8 +1130,7 @@ impl Hidpp20Driver {
             /* setSensorDPI is fn=3; only sensor_index + dpi_hi + dpi_lo are needed */
             let response = self
                 .feature_request(io, idx, DPI_FN_SET_SENSOR_DPI, &[0, hi, lo])
-                .await
-                .context("Failed to write DPI")?;
+                .await?;
             let actual_dpi = u16::from_be_bytes([response[1], response[2]]);
             debug!(
                 "HID++ 2.0: committed DPI = {} (device ack: {})",
@@ -1110,8 +1162,7 @@ impl Hidpp20Driver {
              * always produce values 1–8 so this is purely defensive. */
             let rate_ms = (1000 / profile.report_rate).min(u32::from(u8::MAX)) as u8;
             self.feature_request(io, idx, RATE_FN_SET_REPORT_RATE, &[rate_ms])
-                .await
-                .context("Failed to write report rate")?;
+                .await?;
             debug!(
                 "HID++ 2.0: committed report rate = {} Hz",
                 profile.report_rate
@@ -1348,10 +1399,7 @@ impl super::DeviceDriver for Hidpp20Driver {
             debug!("HID++ 2.0 probe at index 0x{idx:02X}: no response");
         }
 
-        anyhow::bail!(
-            "HID++ 2.0 protocol version probe failed (tried indices: {:02X?})",
-            PROBE_INDICES
-        );
+        Err(HidppDriverError::ProbeFailed(PROBE_INDICES.to_vec()).into())
     }
 
     async fn load_profiles(&mut self, io: &mut DeviceIo, info: &mut DeviceInfo) -> Result<()> {
@@ -1363,8 +1411,7 @@ impl super::DeviceDriver for Hidpp20Driver {
 
             let desc_data = self
                 .feature_request(io, idx, PROFILES_FN_GET_PROFILES_DESCR, &[])
-                .await
-                .context("Failed to get Onboard Profiles Description")?;
+                .await?;
 
             info!("HID++ 2.0: raw descriptor bytes: {:02X?}", &desc_data[..16]);
 
@@ -1908,7 +1955,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                  * being valid before the first write — the G305 may have an
                  * uninitialised directory that throws ERR_INVALID_ARGUMENT. */
                 let mut any_written = false;
-                let mut last_err: Option<anyhow::Error> = None;
+                let mut last_err: Option<HidppDriverError> = None;
                 for profile in &info.profiles {
                     if !profile.is_dirty && !force_repair {
                         continue;
@@ -2064,7 +2111,7 @@ impl super::DeviceDriver for Hidpp20Driver {
                 if let Some(e) = last_err {
                     /* Keep the flag set so we retry on the next commit. */
                     self.needs_eeprom_repair = true;
-                    return Err(e);
+                    return Err(e.into());
                 }
 
                 /* Successful rewrite clears the repair flag. */
