@@ -24,8 +24,9 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use async_trait::async_trait;
+use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::engine::device::{
@@ -95,6 +96,9 @@ const STEELSERIES_DPI_MAGIC_MARKER: u8 = 0x42;
  * the firmware can absorb the previous command; saves to NVRAM want longer. */
 const SETTLE: Duration = Duration::from_millis(10);
 const SETTLE_SAVE: Duration = Duration::from_millis(20);
+
+/* Deadline for reading a device reply (firmware / settings queries). */
+const READ_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /* ---------------------------------------------------------------------- */
 /* Report builder                                                         */
@@ -175,19 +179,67 @@ enum ProtocolVersion {
 }
 
 impl TryFrom<u32> for ProtocolVersion {
-    type Error = anyhow::Error; /* becomes SteelSeriesError in a later phase */
+    type Error = SteelSeriesError;
 
-    fn try_from(value: u32) -> Result<Self> {
+    fn try_from(value: u32) -> Result<Self, SteelSeriesError> {
         match value {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
             4 => Ok(Self::V4),
-            other => Err(anyhow!(
-                "SteelSeries: unsupported DeviceVersion {other} (expected 1-4)"
-            )),
+            other => Err(SteelSeriesError::InvalidDeviceVersion(other)),
         }
     }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Error topology                                                         */
+/* ---------------------------------------------------------------------- */
+
+/* Concrete failure modes at the SteelSeries hardware boundary.
+ *
+ * Every I/O helper below returns this type so callers (and, through the
+ * DeviceDriver trait boundary, the IPC/DBus layer) can distinguish a mute
+ * device from a garbled response from a caller bug, instead of pattern
+ * matching on type-erased strings. */
+#[derive(Debug, Error)]
+pub enum SteelSeriesError {
+    /* The device did not answer a read within the deadline. */
+    #[error("SteelSeries: device timed out waiting for report 0x{opcode:02x}")]
+    DeviceTimeout { opcode: u8 },
+
+    /* A response arrived but is too short to parse. */
+    #[error("SteelSeries: malformed report 0x{opcode:02x}: {len} byte(s), expected at least {expected}")]
+    MalformedReport { opcode: u8, len: usize, expected: usize },
+
+    /* The LED mode has no wire encoding for this device's protocol. */
+    #[error("SteelSeries: unsupported LED mode {mode:?}")]
+    UnsupportedLedMode { mode: LedMode },
+
+    /* Packet construction computed an offset beyond the report length.
+     * (Wired into the Report builder in the next phase.) */
+    #[error("SteelSeries: out-of-bounds write at offset {offset} (report length {len})")]
+    OutOfBoundsWrite { offset: usize, len: usize },
+
+    /* The underlying HID transport failed (hidraw write / feature ioctl). */
+    #[error("SteelSeries: transport failure on report 0x{opcode:02x}: {source}")]
+    Transport {
+        opcode: u8,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /* Device database entry problems, rejected before any I/O. */
+    #[error("SteelSeries: DeviceVersion missing from device database entry")]
+    MissingDeviceVersion,
+
+    #[error("SteelSeries: unsupported DeviceVersion {0} (expected 1-4)")]
+    InvalidDeviceVersion(u32),
+
+    /* Initialization-order guard: command paths run only after
+     * load_profiles has parsed the config. */
+    #[error("SteelSeries: driver used before load_profiles initialized the protocol version")]
+    NotInitialized,
 }
 
 /* ---------------------------------------------------------------------- */
@@ -236,10 +288,8 @@ impl SteelseriesDriver {
     /* The parsed protocol version.  Every command path runs after
      * load_profiles (the actor aborts device registration if it fails), so
      * this error is an initialization-order guard, not a runtime state. */
-    fn version(&self) -> Result<ProtocolVersion> {
-        self.version.ok_or_else(|| {
-            anyhow!("SteelSeries: driver used before load_profiles initialized the protocol version")
-        })
+    fn version(&self) -> Result<ProtocolVersion, SteelSeriesError> {
+        self.version.ok_or(SteelSeriesError::NotInitialized)
     }
 }
 
@@ -273,9 +323,10 @@ impl DeviceDriver for SteelseriesDriver {
         /* Reject invalid protocol state up front: driving a device with
          * guessed V1 opcodes it may not speak is worse than not driving it.
          * Every shipped steelseries .device file sets DeviceVersion. */
-        let raw = info.driver_config.device_version.ok_or_else(|| {
-            anyhow!("SteelSeries: DeviceVersion missing from device database entry")
-        })?;
+        let raw = info
+            .driver_config
+            .device_version
+            .ok_or(SteelSeriesError::MissingDeviceVersion)?;
         let version = ProtocolVersion::try_from(raw)?;
         self.version = Some(version);
         self.quirks = DeviceQuirks::from_config(&info.driver_config);
@@ -341,8 +392,10 @@ impl DeviceDriver for SteelseriesDriver {
             info.profiles.push(profile);
         }
 
-        if let Ok(fw) = self.read_firmware_version(io).await {
-            info.firmware_version = fw;
+        match self.read_firmware_version(io).await {
+            Ok(fw) => info.firmware_version = fw,
+            /* Best-effort: some variants are write-only for this report. */
+            Err(e) => debug!("SteelSeries: firmware version unavailable: {e}"),
         }
 
         Ok(())
@@ -467,21 +520,21 @@ impl SteelseriesDriver {
         bytes: &[u8],
         opcode: u8,
         delay: Duration,
-    ) -> Result<()> {
+    ) -> Result<(), SteelSeriesError> {
         tokio::time::sleep(delay).await;
         if feature {
             io.set_feature_report(bytes)
-                .with_context(|| format!("SteelSeries feature report 0x{opcode:02x} failed"))?;
+                .map_err(|e| SteelSeriesError::Transport { opcode, source: Box::new(e) })?;
         } else {
             io.write_report(bytes)
                 .await
-                .with_context(|| format!("SteelSeries output report 0x{opcode:02x} failed"))?;
+                .map_err(|e| SteelSeriesError::Transport { opcode, source: e.into() })?;
         }
         Ok(())
     }
 
     /* Send a fully-built report after the standard settle delay. */
-    async fn send(&self, io: &mut DeviceIo, report: &Report) -> Result<()> {
+    async fn send(&self, io: &mut DeviceIo, report: &Report) -> Result<(), SteelSeriesError> {
         self.dispatch(io, report.feature, report.bytes(), report.opcode, SETTLE)
             .await
     }
@@ -492,7 +545,12 @@ impl SteelseriesDriver {
 /* ---------------------------------------------------------------------- */
 
 impl SteelseriesDriver {
-    async fn write_dpi(&self, io: &mut DeviceIo, res: &ResolutionInfo, info: &DeviceInfo) -> Result<()> {
+    async fn write_dpi(
+        &self,
+        io: &mut DeviceIo,
+        res: &ResolutionInfo,
+        info: &DeviceInfo,
+    ) -> Result<(), SteelSeriesError> {
         let dpi_val = match res.dpi {
             Dpi::Unified(d) => d,
             Dpi::Separate { x, .. } => x,
@@ -542,7 +600,7 @@ impl SteelseriesDriver {
         self.send(io, &report).await
     }
 
-    async fn write_report_rate(&self, io: &mut DeviceIo, hz: u32) -> Result<()> {
+    async fn write_report_rate(&self, io: &mut DeviceIo, hz: u32) -> Result<(), SteelSeriesError> {
         let version = self.version()?;
         let report = match version {
             ProtocolVersion::V1 | ProtocolVersion::V4 => {
@@ -581,7 +639,12 @@ impl SteelseriesDriver {
         self.send(io, &report).await
     }
 
-    async fn write_buttons(&self, io: &mut DeviceIo, profile: &ProfileInfo, info: &DeviceInfo) -> Result<()> {
+    async fn write_buttons(
+        &self,
+        io: &mut DeviceIo,
+        profile: &ProfileInfo,
+        info: &DeviceInfo,
+    ) -> Result<(), SteelSeriesError> {
         /* A reported macro length of zero means button writes are unsupported. */
         if info.driver_config.macro_length == Some(0) {
             return Ok(());
@@ -641,7 +704,7 @@ impl SteelseriesDriver {
         }
     }
 
-    async fn write_save(&self, io: &mut DeviceIo) -> Result<()> {
+    async fn write_save(&self, io: &mut DeviceIo) -> Result<(), SteelSeriesError> {
         let (opcode, len) = match self.version()? {
             ProtocolVersion::V1 => (STEELSERIES_ID_SAVE_SHORT, STEELSERIES_REPORT_SIZE_SHORT),
             ProtocolVersion::V2 => (STEELSERIES_ID_SAVE, STEELSERIES_REPORT_SIZE),
@@ -658,7 +721,7 @@ impl SteelseriesDriver {
     /* LEDs                                                                */
     /* ------------------------------------------------------------------ */
 
-    async fn write_led(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
+    async fn write_led(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         match self.version()? {
             ProtocolVersion::V1 => self.write_led_v1(io, led).await,
             ProtocolVersion::V2 => self.write_led_v2(io, led).await,
@@ -666,13 +729,13 @@ impl SteelseriesDriver {
             /* No V4 LED command exists in the protocol (C driver parity);
              * the only V4 device (Rival 650) declares Leds=0, so reaching
              * this arm means the device database entry is wrong. */
-            ProtocolVersion::V4 => bail!("SteelSeries V4 has no LED protocol"),
+            ProtocolVersion::V4 => Err(SteelSeriesError::UnsupportedLedMode { mode: led.mode }),
         }
     }
 
     /* V1: a separate effect report followed by a color/intensity report.
      * Rival100 and SenseiRaw both deviate (color opcode / monochrome). */
-    async fn write_led_v1(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
+    async fn write_led_v1(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         let rival100 = self.quirks.is_rival100;
         let senseiraw = self.quirks.is_senseiraw;
 
@@ -688,11 +751,9 @@ impl SteelseriesDriver {
                     0x02
                 }
             }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "SteelSeries V1: unsupported LED mode {:?}",
-                    led.mode
-                ));
+            /* V1 hardware has no cycle/wave-style animations. */
+            LedMode::Cycle | LedMode::ColorWave | LedMode::Starlight | LedMode::TriColor => {
+                return Err(SteelSeriesError::UnsupportedLedMode { mode: led.mode });
             }
         };
 
@@ -744,11 +805,11 @@ impl SteelseriesDriver {
      *   repeat   → parameters[19]
      *   npoints  → parameters[27]
      *   color data starts at parameters[28] (buf offset 29). */
-    async fn write_led_v2(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
+    async fn write_led_v2(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         let mut report = Report::output(STEELSERIES_ID_LED, STEELSERIES_REPORT_SIZE);
         report.param(2, led.index as u8);
 
-        let (repeat, points, duration) = build_cycle_points(led);
+        let (repeat, points, duration) = build_cycle_points(led)?;
         if !repeat {
             report.param(19, 0x01);
         }
@@ -768,11 +829,11 @@ impl SteelseriesDriver {
      *   repeat   → parameters[24]
      *   npoints  → parameters[29]
      *   color data starts at parameters[30] (buf offset 30). */
-    async fn write_led_v3(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<()> {
+    async fn write_led_v3(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         let mut report = Report::feature(STEELSERIES_ID_LED_PROTOCOL3, STEELSERIES_REPORT_SIZE);
         report.param(2, led.index as u8).param(7, led.index as u8);
 
-        let (repeat, points, duration) = build_cycle_points(led);
+        let (repeat, points, duration) = build_cycle_points(led)?;
         if !repeat {
             report.param(24, 0x01);
         }
@@ -789,7 +850,22 @@ impl SteelseriesDriver {
     /* Hardware reads                                                      */
     /* ------------------------------------------------------------------ */
 
-    async fn read_firmware_version(&self, io: &mut DeviceIo) -> Result<String> {
+    /* Read one reply report within the standard deadline, mapping the two
+     * transport failure shapes onto the concrete error topology. */
+    async fn read_reply(
+        &self,
+        io: &mut DeviceIo,
+        opcode: u8,
+        buf: &mut [u8],
+    ) -> Result<usize, SteelSeriesError> {
+        match tokio::time::timeout(READ_REPLY_TIMEOUT, io.read_report(buf)).await {
+            Ok(Ok(n)) => Ok(n),
+            Ok(Err(e)) => Err(SteelSeriesError::Transport { opcode, source: e.into() }),
+            Err(_elapsed) => Err(SteelSeriesError::DeviceTimeout { opcode }),
+        }
+    }
+
+    async fn read_firmware_version(&self, io: &mut DeviceIo) -> Result<String, SteelSeriesError> {
         let (opcode, len) = match self.version()? {
             ProtocolVersion::V1 => {
                 (STEELSERIES_ID_FIRMWARE_PROTOCOL1, STEELSERIES_REPORT_SIZE_SHORT)
@@ -803,22 +879,22 @@ impl SteelseriesDriver {
 
         self.send(io, &Report::output(opcode, len)).await?;
 
-        /* Best-effort read: some variants are write-only for this report. */
         let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        if let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(500), io.read_report(&mut buf)).await
-        {
-            if n >= 2 {
-                let major = buf.get(1).copied().unwrap_or(0);
-                let minor = buf.get(0).copied().unwrap_or(0);
-                return Ok(format!("{major}.{minor}"));
-            }
+        let n = self.read_reply(io, opcode, &mut buf).await?;
+        if n < 2 {
+            return Err(SteelSeriesError::MalformedReport { opcode, len: n, expected: 2 });
         }
 
-        Ok(String::new())
+        let major = buf.get(1).copied().unwrap_or(0);
+        let minor = buf.first().copied().unwrap_or(0);
+        Ok(format!("{major}.{minor}"))
     }
 
-    async fn read_settings(&self, io: &mut DeviceIo, profile: &mut ProfileInfo) -> Result<()> {
+    async fn read_settings(
+        &self,
+        io: &mut DeviceIo,
+        profile: &mut ProfileInfo,
+    ) -> Result<(), SteelSeriesError> {
         let version = self.version()?;
         let settings_id = match version {
             ProtocolVersion::V2 => STEELSERIES_ID_SETTINGS,
@@ -832,13 +908,9 @@ impl SteelseriesDriver {
             .await?;
 
         let mut buf = [0u8; STEELSERIES_REPORT_SIZE];
-        let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(500), io.read_report(&mut buf)).await
-        else {
-            return Ok(());
-        };
+        let n = self.read_reply(io, settings_id, &mut buf).await?;
         if n < 2 {
-            return Ok(());
+            return Err(SteelSeriesError::MalformedReport { opcode: settings_id, len: n, expected: 2 });
         }
 
         match version {
@@ -978,10 +1050,10 @@ impl CyclePoint {
 
 /* Build the cycle control points for a LED mode.  Returns (repeat, points,
  * duration_ms). */
-fn build_cycle_points(led: &LedInfo) -> (bool, Vec<CyclePoint>, u16) {
+fn build_cycle_points(led: &LedInfo) -> Result<(bool, Vec<CyclePoint>, u16), SteelSeriesError> {
     match led.mode {
-        LedMode::Off => (false, vec![CyclePoint::new(0, 0, 0, 0x00)], 5000),
-        LedMode::Solid => (false, vec![CyclePoint::solid(&led.color, 0x00)], 5000),
+        LedMode::Off => Ok((false, vec![CyclePoint::new(0, 0, 0, 0x00)], 5000)),
+        LedMode::Solid => Ok((false, vec![CyclePoint::solid(&led.color, 0x00)], 5000)),
         LedMode::Cycle => {
             /* 4-point rainbow: red → green → blue → red. */
             let points = vec![
@@ -990,7 +1062,7 @@ fn build_cycle_points(led: &LedInfo) -> (bool, Vec<CyclePoint>, u16) {
                 CyclePoint::new(0x00, 0x00, 0xFF, 0x55),
                 CyclePoint::new(0xFF, 0x00, 0x00, 0x55),
             ];
-            (true, points, led.effect_duration as u16)
+            Ok((true, points, led.effect_duration as u16))
         }
         LedMode::Breathing => {
             /* 3-point breathe: black → color → black. */
@@ -999,9 +1071,13 @@ fn build_cycle_points(led: &LedInfo) -> (bool, Vec<CyclePoint>, u16) {
                 CyclePoint::solid(&led.color, 0x7F),
                 CyclePoint::new(0, 0, 0, 0x7F),
             ];
-            (true, points, led.effect_duration as u16)
+            Ok((true, points, led.effect_duration as u16))
         }
-        _ => (false, vec![CyclePoint::new(0, 0, 0, 0x00)], 5000),
+        /* No cycle-buffer encoding exists for these animations; reject the
+         * commit instead of silently writing a black LED. */
+        LedMode::ColorWave | LedMode::Starlight | LedMode::TriColor => {
+            Err(SteelSeriesError::UnsupportedLedMode { mode: led.mode })
+        }
     }
 }
 
@@ -1177,5 +1253,59 @@ mod tests {
             !profile.buttons[0].action_types.contains(&(ActionType::Macro as u32)),
             "SenseiRaw buttons must not advertise Macro"
         );
+    }
+
+    /* Errors crossing the DeviceDriver trait boundary must stay
+     * downcastable to the concrete type for the IPC layer. */
+    #[tokio::test]
+    async fn trait_boundary_errors_downcast_to_concrete_type() {
+        let (mut io, _handle) = DeviceIo::with_mock(Vec::new());
+        let mut info = make_info(None, &[]);
+        let mut drv = SteelseriesDriver::new();
+
+        let err = drv.load_profiles(&mut io, &mut info).await.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SteelSeriesError>(),
+            Some(SteelSeriesError::MissingDeviceVersion)
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_led_rejects_unencodable_mode_before_io() {
+        let (mut io, handle) = DeviceIo::with_mock(Vec::new());
+        let mut drv = SteelseriesDriver::new();
+        drv.version = Some(ProtocolVersion::V2);
+
+        let mut led = build_led(ProtocolVersion::V2, 0, false);
+        led.mode = LedMode::ColorWave;
+
+        let err = drv.write_led(&mut io, &led).await.unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::UnsupportedLedMode { mode: LedMode::ColorWave }
+        ));
+        assert!(handle.writes().is_empty(), "must reject before touching the wire");
+    }
+
+    /* A mute device surfaces as DeviceTimeout, not a swallowed Ok.
+     * start_paused: the 500 ms read deadline elapses instantly. */
+    #[tokio::test(start_paused = true)]
+    async fn read_settings_times_out_as_concrete_error() {
+        let settings_request = Report::output(STEELSERIES_ID_SETTINGS, STEELSERIES_REPORT_SIZE);
+        let (mut io, _handle) = DeviceIo::with_mock(vec![MockExchange {
+            expect: Some(settings_request.bytes().to_vec()),
+            reply: crate::hal::mock::MockReply::Silence,
+        }]);
+        let mut drv = SteelseriesDriver::new();
+        drv.version = Some(ProtocolVersion::V2);
+
+        let mut info = make_info(Some(2), &[]);
+        let profile = &mut info.profiles[0];
+
+        let err = drv.read_settings(&mut io, profile).await.unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::DeviceTimeout { opcode: STEELSERIES_ID_SETTINGS }
+        ));
     }
 }
