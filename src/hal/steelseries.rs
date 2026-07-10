@@ -134,22 +134,28 @@ impl Report {
         Self { buf, len, base: 0, feature: true, opcode }
     }
 
-    /* Write the C `parameters[i]` slot. */
-    fn param(&mut self, i: usize, value: u8) -> &mut Self {
+    /* Write the C `parameters[i]` slot.
+     *
+     * An offset beyond the report length is a bug in the caller's mapping
+     * math, never a device condition: fail packet construction instead of
+     * silently truncating the command. */
+    fn param(&mut self, i: usize, value: u8) -> Result<&mut Self, SteelSeriesError> {
         let off = self.base + i;
-        if off < self.len {
-            self.buf[off] = value;
+        if off >= self.len {
+            return Err(SteelSeriesError::OutOfBoundsWrite { offset: off, len: self.len });
         }
-        self
+        self.buf[off] = value;
+        Ok(self)
     }
 
     /* Write a little-endian u16 into `parameters[i..i+2]`. */
-    fn param_u16_le(&mut self, i: usize, value: u16) -> &mut Self {
+    fn param_u16_le(&mut self, i: usize, value: u16) -> Result<&mut Self, SteelSeriesError> {
         let off = self.base + i;
-        if off + 1 < self.len {
-            self.buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+        if off + 1 >= self.len {
+            return Err(SteelSeriesError::OutOfBoundsWrite { offset: off + 1, len: self.len });
         }
-        self
+        self.buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+        Ok(self)
     }
 
     /* Mutable view of the active payload, for the few writers that pack bytes
@@ -572,27 +578,27 @@ impl SteelseriesDriver {
                     (res.dpi_list.len() - pos) as u8
                 };
                 let mut r = Report::output(STEELSERIES_ID_DPI_SHORT, STEELSERIES_REPORT_SIZE_SHORT);
-                r.param(1, res_id).param(2, scaled);
+                r.param(1, res_id)?.param(2, scaled)?;
                 r
             }
             ProtocolVersion::V2 => {
                 let mut r = Report::output(STEELSERIES_ID_DPI, STEELSERIES_REPORT_SIZE);
-                r.param(2, res_id)
-                    .param(3, scaled)
-                    .param(6, STEELSERIES_DPI_MAGIC_MARKER);
+                r.param(2, res_id)?
+                    .param(3, scaled)?
+                    .param(6, STEELSERIES_DPI_MAGIC_MARKER)?;
                 r
             }
             ProtocolVersion::V3 => {
                 let mut r = Report::output(STEELSERIES_ID_DPI_PROTOCOL3, STEELSERIES_REPORT_SIZE);
-                r.param(2, res_id)
-                    .param(3, scaled)
-                    .param(5, STEELSERIES_DPI_MAGIC_MARKER);
+                r.param(2, res_id)?
+                    .param(3, scaled)?
+                    .param(5, STEELSERIES_DPI_MAGIC_MARKER)?;
                 r
             }
             ProtocolVersion::V4 => {
                 /* V4 uses the 64-byte report, not SHORT. */
                 let mut r = Report::output(STEELSERIES_ID_DPI_PROTOCOL4, STEELSERIES_REPORT_SIZE);
-                r.param(1, res_id).param(2, scaled);
+                r.param(1, res_id)?.param(2, scaled)?;
                 r
             }
         };
@@ -620,7 +626,7 @@ impl SteelseriesDriver {
                     STEELSERIES_ID_REPORT_RATE_PROTOCOL4
                 };
                 let mut r = Report::output(opcode, STEELSERIES_REPORT_SIZE_SHORT);
-                r.param(2, rate_code);
+                r.param(2, rate_code)?;
                 r
             }
             ProtocolVersion::V2 | ProtocolVersion::V3 => {
@@ -631,7 +637,7 @@ impl SteelseriesDriver {
                     STEELSERIES_ID_REPORT_RATE_PROTOCOL3
                 };
                 let mut r = Report::output(opcode, STEELSERIES_REPORT_SIZE);
-                r.param(2, rate_val);
+                r.param(2, rate_val)?;
                 r
             }
         };
@@ -668,10 +674,12 @@ impl SteelseriesDriver {
 
         for button in &profile.buttons {
             /* Each button occupies `button_size` bytes from parameters[2]
-             * onward, i.e. output-report offset 3. */
+             * onward, i.e. output-report offset 3.  A slot beyond the report
+             * means the device database button count disagrees with the
+             * layout math — refuse to build a truncated table. */
             let idx = 3 + (button.index as usize) * button_size;
             if idx >= report_size {
-                continue;
+                return Err(SteelSeriesError::OutOfBoundsWrite { offset: idx, len: report_size });
             }
 
             match button.action_type {
@@ -679,7 +687,7 @@ impl SteelseriesDriver {
                     buf[idx] = button.mapping_value as u8;
                 }
                 ActionType::Key | ActionType::Macro => {
-                    pack_key_button(buf, idx, report_size, button, senseiraw, max_modifiers);
+                    pack_key_button(buf, idx, report_size, button, senseiraw, max_modifiers)?;
                 }
                 ActionType::Special => {
                     buf[idx] = match button.mapping_value {
@@ -760,8 +768,8 @@ impl SteelseriesDriver {
         let mut effect_report =
             Report::output(STEELSERIES_ID_LED_EFFECT_SHORT, STEELSERIES_REPORT_SIZE_SHORT);
         effect_report
-            .param(1, if rival100 { 0x00 } else { led.index as u8 + 1 })
-            .param(2, effect);
+            .param(1, if rival100 { 0x00 } else { led.index as u8 + 1 })?
+            .param(2, effect)?;
         self.send(io, &effect_report).await?;
 
         /* Second report: color (RGB) or intensity (monochrome). */
@@ -774,7 +782,7 @@ impl SteelseriesDriver {
             };
             let mut r =
                 Report::output(STEELSERIES_ID_LED_INTENSITY_SHORT, STEELSERIES_REPORT_SIZE_SHORT);
-            r.param(1, led.index as u8 + 1).param(2, intensity);
+            r.param(1, led.index as u8 + 1)?.param(2, intensity)?;
             r
         } else if rival100 {
             /* Rival100 uses a different color opcode and a fixed led id of 0. */
@@ -782,17 +790,17 @@ impl SteelseriesDriver {
                 STEELSERIES_ID_LED_COLOR_SHORT_RIVAL100,
                 STEELSERIES_REPORT_SIZE_SHORT,
             );
-            r.param(1, 0x00)
-                .param(2, led.color.red as u8)
-                .param(3, led.color.green as u8)
-                .param(4, led.color.blue as u8);
+            r.param(1, 0x00)?
+                .param(2, led.color.red as u8)?
+                .param(3, led.color.green as u8)?
+                .param(4, led.color.blue as u8)?;
             r
         } else {
             let mut r = Report::output(STEELSERIES_ID_LED_COLOR_SHORT, STEELSERIES_REPORT_SIZE_SHORT);
-            r.param(1, led.index as u8 + 1)
-                .param(2, led.color.red as u8)
-                .param(3, led.color.green as u8)
-                .param(4, led.color.blue as u8);
+            r.param(1, led.index as u8 + 1)?
+                .param(2, led.color.red as u8)?
+                .param(3, led.color.green as u8)?
+                .param(4, led.color.blue as u8)?;
             r
         };
 
@@ -807,17 +815,17 @@ impl SteelseriesDriver {
      *   color data starts at parameters[28] (buf offset 29). */
     async fn write_led_v2(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         let mut report = Report::output(STEELSERIES_ID_LED, STEELSERIES_REPORT_SIZE);
-        report.param(2, led.index as u8);
+        report.param(2, led.index as u8)?;
 
         let (repeat, points, duration) = build_cycle_points(led)?;
         if !repeat {
-            report.param(19, 0x01);
+            report.param(19, 0x01)?;
         }
 
-        let npoints = write_cycle_points(report.body_mut(), 29, &points);
-        report.param(27, npoints);
+        let npoints = write_cycle_points(report.body_mut(), 29, &points)?;
+        report.param(27, npoints)?;
         let d = (npoints as u16 * 330).max(duration);
-        report.param_u16_le(3, d);
+        report.param_u16_le(3, d)?;
 
         self.send(io, &report).await
     }
@@ -831,17 +839,17 @@ impl SteelseriesDriver {
      *   color data starts at parameters[30] (buf offset 30). */
     async fn write_led_v3(&self, io: &mut DeviceIo, led: &LedInfo) -> Result<(), SteelSeriesError> {
         let mut report = Report::feature(STEELSERIES_ID_LED_PROTOCOL3, STEELSERIES_REPORT_SIZE);
-        report.param(2, led.index as u8).param(7, led.index as u8);
+        report.param(2, led.index as u8)?.param(7, led.index as u8)?;
 
         let (repeat, points, duration) = build_cycle_points(led)?;
         if !repeat {
-            report.param(24, 0x01);
+            report.param(24, 0x01)?;
         }
 
-        let npoints = write_cycle_points(report.body_mut(), 30, &points);
-        report.param(29, npoints);
+        let npoints = write_cycle_points(report.body_mut(), 30, &points)?;
+        report.param(29, npoints)?;
         let d = (npoints as u16 * 330).max(duration);
-        report.param_u16_le(8, d);
+        report.param_u16_le(8, d)?;
 
         self.send(io, &report).await
     }
@@ -966,7 +974,9 @@ fn pack_key_button(
     button: &ButtonInfo,
     senseiraw: bool,
     max_modifiers: usize,
-) {
+) -> Result<(), SteelSeriesError> {
+    let oob = |offset: usize| SteelSeriesError::OutOfBoundsWrite { offset, len: report_size };
+
     let mut modifiers = 0u8;
     let mut final_key = 0u8;
 
@@ -996,18 +1006,20 @@ fn pack_key_button(
     if final_key == 0 {
         /* No keyboard usage: treat as a consumer-control binding. */
         buf[idx] = STEELSERIES_BUTTON_CONSUMER;
-        if idx + 1 < report_size {
-            buf[idx + 1] = (button.mapping_value % 256) as u8;
+        if idx + 1 >= report_size {
+            return Err(oob(idx + 1));
         }
-        return;
+        buf[idx + 1] = (button.mapping_value % 256) as u8;
+        return Ok(());
     }
 
     if senseiraw {
         buf[idx] = STEELSERIES_BUTTON_KEY;
-        if idx + 1 < report_size {
-            buf[idx + 1] = final_key;
+        if idx + 1 >= report_size {
+            return Err(oob(idx + 1));
         }
-        return;
+        buf[idx + 1] = final_key;
+        return Ok(());
     }
 
     /* Standard keyboard: opcode, up to `max_modifiers` modifier usages, key. */
@@ -1015,15 +1027,18 @@ fn pack_key_button(
     let mut cursor = idx;
     for (bit, &usage) in MODIFIER_USAGE.iter().enumerate() {
         if (modifiers & (1 << bit)) != 0 && cursor - idx < max_modifiers {
-            if cursor + 1 < report_size {
-                buf[cursor + 1] = usage;
+            if cursor + 1 >= report_size {
+                return Err(oob(cursor + 1));
             }
+            buf[cursor + 1] = usage;
             cursor += 1;
         }
     }
-    if cursor + 1 < report_size {
-        buf[cursor + 1] = final_key;
+    if cursor + 1 >= report_size {
+        return Err(oob(cursor + 1));
     }
+    buf[cursor + 1] = final_key;
+    Ok(())
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1084,13 +1099,24 @@ fn build_cycle_points(led: &LedInfo) -> Result<(bool, Vec<CyclePoint>, u16), Ste
 /* Write cycle points into `buf` following the C construct_cycle_buffer()
  * layout: the first point's color is duplicated as a 3-byte RGB header
  * immediately before the regular 4-byte (r,g,b,pos) point array.
- * Returns the number of points written. */
-fn write_cycle_points(buf: &mut [u8], header_start: usize, points: &[CyclePoint]) -> u8 {
+ * Returns the number of points written, or OutOfBoundsWrite if the header
+ * or any point would land beyond the report. */
+fn write_cycle_points(
+    buf: &mut [u8],
+    header_start: usize,
+    points: &[CyclePoint],
+) -> Result<u8, SteelSeriesError> {
+    let len = buf.len();
+    let oob = |offset: usize| SteelSeriesError::OutOfBoundsWrite { offset, len };
+
     let mut color_idx = header_start;
 
     for (i, pt) in points.iter().enumerate() {
         if i == 0 {
             /* Write the first point's color as a 3-byte header. */
+            if color_idx + 2 >= len {
+                return Err(oob(color_idx + 2));
+            }
             buf[color_idx] = pt.r;
             buf[color_idx + 1] = pt.g;
             buf[color_idx + 2] = pt.b;
@@ -1098,15 +1124,16 @@ fn write_cycle_points(buf: &mut [u8], header_start: usize, points: &[CyclePoint]
         }
 
         let base = color_idx + i * 4;
-        if base + 3 < buf.len() {
-            buf[base] = pt.r;
-            buf[base + 1] = pt.g;
-            buf[base + 2] = pt.b;
-            buf[base + 3] = pt.pos;
+        if base + 3 >= len {
+            return Err(oob(base + 3));
         }
+        buf[base] = pt.r;
+        buf[base + 1] = pt.g;
+        buf[base + 2] = pt.b;
+        buf[base + 3] = pt.pos;
     }
 
-    points.len() as u8
+    Ok(points.len() as u8)
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1307,5 +1334,109 @@ mod tests {
             err,
             SteelSeriesError::DeviceTimeout { opcode: STEELSERIES_ID_SETTINGS }
         ));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Phase 4: buffer integrity                                           */
+    /* ------------------------------------------------------------------ */
+
+    #[test]
+    fn report_param_rejects_out_of_bounds_offset() {
+        /* Output report of 32 bytes: base 1, so parameters[30] hits byte 31
+         * (the last slot) and parameters[31] would hit byte 32 — OOB. */
+        let mut r = Report::output(0x03, STEELSERIES_REPORT_SIZE_SHORT);
+        assert!(r.param(30, 0xAA).is_ok());
+        assert_eq!(r.bytes()[31], 0xAA);
+
+        let err = r.param(31, 0xBB).map(drop).unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::OutOfBoundsWrite { offset: 32, len: 32 }
+        ));
+    }
+
+    #[test]
+    fn report_param_u16_rejects_straddling_write() {
+        let mut r = Report::output(0x03, STEELSERIES_REPORT_SIZE_SHORT);
+        /* parameters[29..31] = bytes 30..32: last full u16 slot. */
+        assert!(r.param_u16_le(29, 0xBEEF).is_ok());
+        assert_eq!(&r.bytes()[30..32], &0xBEEFu16.to_le_bytes());
+
+        /* parameters[30..32] would touch byte 32 — one past the end. */
+        let err = r.param_u16_le(30, 0xBEEF).map(drop).unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::OutOfBoundsWrite { offset: 32, len: 32 }
+        ));
+    }
+
+    #[test]
+    fn cycle_points_reject_header_beyond_buffer() {
+        /* Before Phase 4 this header write was unguarded and would panic. */
+        let mut buf = [0u8; 16];
+        let points = vec![CyclePoint::new(1, 2, 3, 0)];
+
+        let err = write_cycle_points(&mut buf, 14, &points).unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::OutOfBoundsWrite { offset: 16, len: 16 }
+        ));
+    }
+
+    #[test]
+    fn cycle_points_reject_point_beyond_buffer() {
+        /* Header fits (3 bytes at 8..11) but the 4-byte point at 11..15
+         * overruns a 14-byte buffer. */
+        let mut buf = [0u8; 14];
+        let points = vec![CyclePoint::new(1, 2, 3, 0)];
+
+        let err = write_cycle_points(&mut buf, 8, &points).unwrap_err();
+        assert!(matches!(
+            err,
+            SteelSeriesError::OutOfBoundsWrite { offset: 14, len: 14 }
+        ));
+
+        /* One byte more and the same layout fits. */
+        let mut buf = [0u8; 15];
+        assert_eq!(write_cycle_points(&mut buf, 8, &points).unwrap(), 1);
+        assert_eq!(&buf[8..15], &[1, 2, 3, 1, 2, 3, 0]);
+    }
+
+    /* End-to-end V2 commit through the checked builder: same dispatch
+     * sequence as the unchecked code produced — DPI, buttons, LED, rate,
+     * save — with no OutOfBoundsWrite for a realistic device layout. */
+    #[tokio::test]
+    async fn commit_v2_dispatches_full_report_sequence() {
+        let info = make_info(Some(2), &[]);
+        let mut drv = SteelseriesDriver::new();
+        drv.version = Some(ProtocolVersion::V2);
+
+        /* The mock replies are irrelevant (commit never reads); expect five
+         * writes in protocol order. */
+        let script = (0..5).map(|_| MockExchange::reply(Vec::new())).collect();
+        let (mut io, handle) = DeviceIo::with_mock(script);
+
+        drv.commit(&mut io, &info).await.expect("commit should succeed");
+
+        let opcodes: Vec<u8> = handle.writes().iter().map(|w| w[1]).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                STEELSERIES_ID_DPI,
+                STEELSERIES_ID_BUTTONS,
+                STEELSERIES_ID_LED,
+                STEELSERIES_ID_REPORT_RATE,
+                STEELSERIES_ID_SAVE,
+            ]
+        );
+        assert!(handle.script_exhausted());
+
+        /* Spot-check the DPI report bytes: res_id 1, scaled (800/100)-1=7,
+         * magic marker at parameters[6]. */
+        let dpi = &handle.writes()[0];
+        assert_eq!(dpi.len(), STEELSERIES_REPORT_SIZE);
+        assert_eq!(dpi[3], 1);
+        assert_eq!(dpi[4], 7);
+        assert_eq!(dpi[7], STEELSERIES_DPI_MAGIC_MARKER);
     }
 }
